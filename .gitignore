@@ -1,0 +1,21 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+.env
+.env.*
+
+# OS junk
+.DS_Store
+
+# Local databases
+*.db
+benchmark.duckdb
+benchmark.duckdb.wal
+
+# Local data snapshots (remove if you want to track sample CSVs)
+Data/*.csv
