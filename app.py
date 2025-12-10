@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 from pathlib import Path
+from datetime import datetime, timedelta
 from db import get_connection, init_db
 from ingest import import_sales_history, import_forecasts
 from metrics import recompute_all_metrics      
@@ -161,13 +162,69 @@ def main():
 
     st.subheader(f"Item: {item_id} — Project: {project}")
 
-    if combined.empty:
+    # Date range controls (by month) - placed near chart
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns([0.08, 0.76, 0.16])
+    
+    with col1:
+        months_back = st.number_input(
+            "Months back",
+            min_value=0,
+            max_value=120,
+            value=24,
+            step=1,
+            key="months_back"
+        )
+    
+    with col3:
+        months_forward = st.number_input(
+            "Months forward",
+            min_value=0,
+            max_value=120,
+            value=12,
+            step=1,
+            key="months_forward"
+        )
+    
+    # Calculate actual dates from month inputs
+    today = datetime.now()
+    first_of_current_month = datetime(today.year, today.month, 1)
+    start_date = (first_of_current_month - timedelta(days=30*months_back)).date()
+    end_date = (first_of_current_month + timedelta(days=30*months_forward + 30)).date()  # Add buffer for end of period
+
+    # Filter data by date range
+    combined['date'] = pd.to_datetime(combined['date'])
+    combined_filtered = combined[(combined['date'].dt.date >= start_date) & (combined['date'].dt.date <= end_date)]
+    
+    history_filtered = history[(pd.to_datetime(history['date']).dt.date >= start_date) & (pd.to_datetime(history['date']).dt.date <= end_date)]
+    forecasts_filtered = forecasts[(pd.to_datetime(forecasts['date']).dt.date >= start_date) & (pd.to_datetime(forecasts['date']).dt.date <= end_date)]
+
+    if combined_filtered.empty:
         st.info("No data for this selection yet.")
         return
 
-    # Chart
+    # Create background shading for past vs future
+    today_date = pd.Timestamp.now().date()
+    
+    # Background rectangles for past/future
+    past_rect = alt.Chart(
+        pd.DataFrame({'start': [pd.Timestamp(start_date)], 'end': [pd.Timestamp(today_date)]})
+    ).mark_rect(opacity=0.1, color='blue').encode(
+        x='start:T',
+        x2='end:T'
+    )
+    
+    future_rect = alt.Chart(
+        pd.DataFrame({'start': [pd.Timestamp(today_date)], 'end': [pd.Timestamp(end_date)]})
+    ).mark_rect(opacity=0.08, color='orange').encode(
+        x='start:T',
+        x2='end:T'
+    )
+    
+    # Main chart
     chart = (
-        alt.Chart(combined)
+        alt.Chart(combined_filtered)
         .mark_line(point=True)
         .encode(
             x="date:T",
@@ -178,7 +235,10 @@ def main():
         .properties(height=400)
         .interactive()
     )
-    st.altair_chart(chart, use_container_width=True)
+    
+    # Layer background and chart
+    layered_chart = (past_rect + future_rect + chart).properties(width=700)
+    st.altair_chart(layered_chart, use_container_width=True)
 
     # ---- Metrics table ----
     st.subheader("Metrics for selected item / methods")
@@ -199,9 +259,9 @@ def main():
     # Show data
     with st.expander("Show raw data"):
         st.write("**Sales history**")
-        st.dataframe(history.sort_values("date"))
+        st.dataframe(history_filtered.sort_values("date"))
         st.write("**Forecasts**")
-        st.dataframe(forecasts.sort_values("date"))
+        st.dataframe(forecasts_filtered.sort_values("date"))
 
 if __name__ == "__main__":
     main()
