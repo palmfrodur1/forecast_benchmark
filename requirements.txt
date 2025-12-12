@@ -2,3 +2,4 @@ duckdb
 pandas
 streamlit
 altair
+requests
