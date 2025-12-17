@@ -17,5 +17,6 @@ venv/
 benchmark.duckdb
 benchmark.duckdb.wal
 
-# Local data snapshots (remove if you want to track sample CSVs)
-Data/*.csv
+# Local data snapshots (only raw sales data is ignored)
+# Track sample CSVs like `sales_history.csv` and `forecasts.csv`.
+Data/raw_sales.csv

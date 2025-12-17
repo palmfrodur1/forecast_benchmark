@@ -9,6 +9,8 @@ from ingest import import_sales_history, import_forecasts
 from metrics import recompute_all_metrics      
 import requests
 import json
+import os
+import time
 
 
 def _format_sim_input(df_history: pd.DataFrame) -> list:
@@ -19,9 +21,14 @@ def _format_sim_input(df_history: pd.DataFrame) -> list:
     out = []
     if df_history.empty:
         return out
-    # Ensure date and sorting
+    # Ensure date and sorting; drop rows with invalid dates
     df = df_history.copy()
-    df['sale_date'] = pd.to_datetime(df['sale_date']).dt.date
+    # coerce to datetime and drop NaT
+    df['sale_date'] = pd.to_datetime(df['sale_date'], errors='coerce')
+    df = df[df['sale_date'].notna()].copy()
+    if df.empty:
+        return out
+    df['sale_date'] = df['sale_date'].dt.date
     df = df.sort_values(['item_id', 'sale_date'])
     for _, row in df.iterrows():
         out.append({
@@ -32,15 +39,67 @@ def _format_sim_input(df_history: pd.DataFrame) -> list:
     return out
 
 
-def _call_forecast_api(payload: dict, url: str = 'https://api.nostradamus-api.com/api/v1/forecast/generate') -> dict:
+def _call_forecast_api(payload: dict, url: str = 'https://api.nostradamus-api.com/api/v1/forecast/generate_async', timeout: int = 300) -> dict:
     """Call the Nostradamus forecasting API and return parsed JSON.
 
-    Default URL set to the domain you tested (`api.nostradamus-api.com`).
+    Default URL uses the async endpoint and a longer timeout to avoid origin timeouts.
     """
     headers = {'Content-Type': 'application/json'}
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    # include API key header if server has API_KEY env var set
+    api_key = os.getenv('API_KEY')
+    if api_key:
+        headers['X-API-Key'] = api_key
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
+
+
+def _submit_job(payload: dict, base_url: str = 'https://api.nostradamus-api.com', webhook_url: str | None = None, timeout: int = 30) -> dict:
+    """Submit a job to the async generate_job endpoint.
+
+    Returns the JSON response which should include `job_id` and `status_url`.
+    If `API_KEY` env var is set it will be sent as `X-API-Key` header.
+    """
+    # build URL
+    url = f"{base_url.rstrip('/')}/api/v1/forecast/generate_job"
+    params = {}
+    if webhook_url:
+        params['webhook_url'] = webhook_url
+
+    headers = {'Content-Type': 'application/json'}
+    api_key = os.getenv('API_KEY')
+    if api_key:
+        headers['X-API-Key'] = api_key
+
+    resp = requests.post(url, headers=headers, params=params, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _poll_job_status(status_url: str, timeout: int = 600, poll_initial: float = 1.0) -> dict:
+    """Poll the job status endpoint until finished or failed, return final job hash.
+
+    Uses `X-API-Key` header if `API_KEY` env var set. Raises on timeout.
+    """
+    headers = {}
+    api_key = os.getenv('API_KEY')
+    if api_key:
+        headers['X-API-Key'] = api_key
+
+    deadline = time.time() + timeout
+    interval = poll_initial
+    while time.time() < deadline:
+        resp = requests.get(status_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        job = resp.json()
+        status = job.get('status')
+        if status in ('finished', 'failed'):
+            return job
+        time.sleep(interval)
+        # gradually increase interval but cap it
+        interval = min(interval * 1.7, 10)
+
+    raise TimeoutError(f"Polling job status timed out after {timeout} seconds")
 
 
 def _parse_nostradamus_response(resp: dict, project: str, fm_override: str | None = None) -> pd.DataFrame:
@@ -279,9 +338,12 @@ def main():
     st.markdown("---")
     gen_col1, gen_col2 = st.columns([1, 1])
     with gen_col2:
+        # Use session state to emulate a modal when Streamlit doesn't support `st.modal` in this runtime
         if st.button("Generate forecasts for project"):
-            # Open modal for parameters
-            with st.modal("Generate forecasts"):
+            st.session_state['_show_project_forecast'] = True
+
+        if st.session_state.get('_show_project_forecast'):
+            with st.expander("Generate forecasts", expanded=True):
                 st.write("Set forecast parameters and run for selected project/item(s)")
                 with st.form("forecast_form"):
                     run_mode = st.selectbox("Mode", options=["local", "timegpt"], index=0)
@@ -293,10 +355,15 @@ def main():
                     forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
                     quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
                     api_key = st.text_input("TimeGPT API key (optional)", type="password")
+                    api_base_url = st.text_input("Forecast API base URL", value="https://api.nostradamus-api.com")
+                    webhook_url = st.text_input("Webhook URL (optional)")
+                    wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
                     item_selection = st.multiselect("Items to include (leave empty = all items in project)", options=items, default=[])
                     submitted = st.form_submit_button("Run and preview")
 
                 if submitted:
+                    # hide the expander after submission
+                    st.session_state['_show_project_forecast'] = False
                     con = get_connection()
                     if item_selection:
                         placeholders = ','.join(['?'] * len(item_selection))
@@ -333,20 +400,45 @@ def main():
                         if run_mode == 'timegpt' and api_key:
                             payload['api_key'] = api_key
 
-                        st.info("Calling forecast API — this may take a while...")
+                        st.info("Submitting job to forecast API — this may take a while to complete...")
                         try:
-                            resp = _call_forecast_api(payload)
+                            resp = _submit_job(payload, base_url=api_base_url, webhook_url=webhook_url)
                         except Exception as e:
-                            st.error(f"Forecast API call failed: {e}")
+                            st.error(f"Job submission failed: {e}")
                             resp = None
 
                         if resp:
-                            st.write("API response preview:")
+                            st.write("Submission result:")
                             st.json(resp)
-                            df_new = _parse_nostradamus_response(resp, project=project, fm_override=local_model if run_mode=='local' else None)
-                            if df_new.empty:
-                                st.warning("Could not parse forecast results automatically. Inspect API response above.")
+                            status_url = resp.get('status_url') or resp.get('status') or resp.get('status_endpoint')
+                            job_id = resp.get('job_id')
+                            if wait_for_completion and status_url:
+                                try:
+                                    st.info("Polling job status until finished...")
+                                    job = _poll_job_status(status_url, timeout=600)
+                                except Exception as e:
+                                    st.error(f"Polling failed: {e}")
+                                    job = None
+
+                                if job:
+                                    st.write("Final job object:")
+                                    st.json(job)
+                                    if job.get('status') == 'finished' and job.get('result'):
+                                        df_new = _parse_nostradamus_response(job.get('result'), project=project, fm_override=local_model if run_mode=='local' else None)
+                                    elif job.get('status') == 'finished' and not job.get('result'):
+                                        st.warning("Job finished but no result field present in job. Inspect job JSON above.")
+                                        df_new = pd.DataFrame()
+                                    else:
+                                        st.error(f"Job ended with status: {job.get('status')}")
+                                        df_new = pd.DataFrame()
+                                else:
+                                    df_new = pd.DataFrame()
                             else:
+                                # not waiting — inform user about job id / status url
+                                st.success(f"Job submitted (job_id={job_id}). Poll {status_url} to check status or wait for webhook delivery.")
+                                df_new = pd.DataFrame()
+
+                            if not df_new.empty:
                                 st.write("Preview of forecasts to import:")
                                 st.dataframe(df_new.head(200))
                                 if st.button("Import forecasts into DB"):
@@ -362,6 +454,113 @@ def main():
     metrics_df = load_metrics(project, item_id, selected_methods)
 
     st.subheader(f"Item: {item_id} — Project: {project}")
+
+    # Per-item forecast: open modal to send only this item's history to the async API
+    if st.button("Generate forecast for this item"):
+        st.session_state['_show_item_forecast'] = True
+
+    if st.session_state.get('_show_item_forecast'):
+        with st.expander("Generate forecast for item", expanded=True):
+            st.write(f"Project: {project} — Item: {item_id}")
+            with st.form("forecast_item_form"):
+                run_mode = st.selectbox("Mode", options=["local", "timegpt"], index=0)
+                local_model = st.selectbox("Local model", options=[
+                    'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
+                ], index=0)
+                freq = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
+                season_length = st.number_input("Season length", min_value=1, max_value=365, value=12)
+                forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
+                quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
+                api_key = st.text_input("TimeGPT API key (optional)", type="password")
+                timeout_seconds = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300)
+                submitted_item = st.form_submit_button("Run and preview")
+
+            if submitted_item:
+                con = get_connection()
+                sql = "SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? AND item_id = ? ORDER BY sale_date"
+                params = [project, item_id]
+                df_hist_item = con.execute(sql, params).fetchdf()
+                con.close()
+
+                if df_hist_item.empty:
+                    st.error("No sales history found for this item.")
+                else:
+                    sim_input_his = _format_sim_input(df_hist_item)
+                    if len(sim_input_his) < 1:
+                        st.error("No valid sale_date rows to send. Check your data.")
+                    else:
+                        payload = {
+                            'sim_input_his': sim_input_his,
+                            'forecast_periods': int(forecast_periods),
+                            'mode': run_mode,
+                            'local_model': local_model,
+                            'season_length': int(season_length),
+                            'freq': freq,
+                        }
+                        if quantiles_text.strip():
+                            try:
+                                quantiles = [float(q.strip()) for q in quantiles_text.split(',') if q.strip()]
+                                payload['quantiles'] = quantiles
+                            except Exception:
+                                st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
+
+                        if run_mode == 'timegpt' and api_key:
+                            payload['api_key'] = api_key
+
+                        # additional fields for async job submission
+                        api_base_url = st.text_input("Forecast API base URL", value="https://api.nostradamus-api.com")
+                        webhook_url = st.text_input("Webhook URL (optional)")
+                        wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
+
+                        st.info("Submitting job to forecast API — this may take a short while...")
+                        try:
+                            resp = _submit_job(payload, base_url=api_base_url, webhook_url=webhook_url, timeout=timeout_seconds)
+                        except Exception as e:
+                            st.error(f"Job submission failed: {e}")
+                            resp = None
+
+                        if resp:
+                            st.write("Submission result:")
+                            st.json(resp)
+                            status_url = resp.get('status_url') or resp.get('status') or resp.get('status_endpoint')
+                            job_id = resp.get('job_id')
+                            if wait_for_completion and status_url:
+                                try:
+                                    st.info("Polling job status until finished...")
+                                    job = _poll_job_status(status_url, timeout=600)
+                                except Exception as e:
+                                    st.error(f"Polling failed: {e}")
+                                    job = None
+
+                                if job:
+                                    st.write("Final job object:")
+                                    st.json(job)
+                                    if job.get('status') == 'finished' and job.get('result'):
+                                        df_new = _parse_nostradamus_response(job.get('result'), project=project, fm_override=local_model if run_mode=='local' else None)
+                                    elif job.get('status') == 'finished' and not job.get('result'):
+                                        st.warning("Job finished but no result field present in job. Inspect job JSON above.")
+                                        df_new = pd.DataFrame()
+                                    else:
+                                        st.error(f"Job ended with status: {job.get('status')}")
+                                        df_new = pd.DataFrame()
+                                else:
+                                    df_new = pd.DataFrame()
+                            else:
+                                st.success(f"Job submitted (job_id={job_id}). Poll {status_url} to check status or wait for webhook delivery.")
+                                df_new = pd.DataFrame()
+
+                            if not df_new.empty:
+                                st.write("Preview of forecasts to import:")
+                                st.dataframe(df_new.head(200))
+                                if st.button("Import forecasts into DB"):
+                                    con = get_connection()
+                                    fm_name = df_new['forecast_method'].iloc[0]
+                                    # delete only this item for safety
+                                    con.execute("DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id = ?", [project, fm_name, item_id])
+                                    con.register('forecasts_api_df_item', df_new)
+                                    con.execute("INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item")
+                                    con.close()
+                                    st.success(f"Imported {len(df_new)} forecast rows into forecasts table (method={fm_name}).")
 
     # Date range controls (by month) - placed near chart
     st.markdown("---")

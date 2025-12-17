@@ -30,7 +30,7 @@ def main():
     parser.add_argument('--local-model', default='auto_arima')
     parser.add_argument('--season-length', type=int, default=12)
     parser.add_argument('--freq', default='MS')
-    parser.add_argument('--api-url', default='https://api.nostradamus-api.com/api/v1/forecast/generate')
+    parser.add_argument('--api-url', default='https://api.nostradamus-api.com/api/v1/forecast/generate_async')
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--retries', type=int, default=3)
     parser.add_argument('--backoff-base', type=int, default=5, help='base seconds for exponential backoff')
