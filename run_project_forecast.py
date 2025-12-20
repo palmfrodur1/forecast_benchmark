@@ -1,4 +1,5 @@
-from app import _format_sim_input, _submit_job, _poll_job_status, _parse_nostradamus_response
+from app import _format_sim_input, _parse_nostradamus_response
+from client_nostradamus import submit_forecast_job, wait_for_job
 from db import get_connection
 import json, time
 
@@ -36,14 +37,16 @@ payload = {
 print('Submitting job to Nostradamus API (generate_job) and polling for result...')
 start = time.time()
 try:
-    base_url = 'https://api.nostradamus-api.com'
-    resp = _submit_job(payload, base_url=base_url)
+    ##base_url = 'https://localhost:8000'
+    base_url = 'https://localhost:8000'
+
+    resp = submit_forecast_job(base_url, payload)
     duration = time.time() - start
     print(f'Job submitted in {duration:.1f}s. job_id={resp.get("job_id")}')
-    status_url = resp.get('status_url')
-    if not status_url:
-        raise SystemExit('No status_url returned by generate_job endpoint')
-    job = _poll_job_status(status_url, timeout=600)
+    job_id = resp.get('job_id')
+    if not job_id:
+        raise SystemExit('No job_id returned by generate_job endpoint')
+    job = wait_for_job(base_url, job_id, timeout_total_s=600, poll_interval_s=1.0)
     if job.get('status') != 'finished':
         raise SystemExit(f"Job ended with status: {job.get('status')}")
     resp = job.get('result') or {}

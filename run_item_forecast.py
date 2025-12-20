@@ -116,7 +116,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--project', default='BMV_v1')
     parser.add_argument('--item-id', required=True)
-    parser.add_argument('--api-url', default='https://api.nostradamus-api.com/api/v1/forecast/generate_async')
+    parser.add_argument('--api-url', default='https://localhost:8000/api/v1/forecast/generate_async')
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--retries', type=int, default=3)
     parser.add_argument('--season-length', type=int, default=12)

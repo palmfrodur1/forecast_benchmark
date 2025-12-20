@@ -11,6 +11,7 @@ import requests
 import json
 import os
 import time
+from urllib.parse import urlparse, urlunparse
 
 
 def _format_sim_input(df_history: pd.DataFrame) -> list:
@@ -39,7 +40,52 @@ def _format_sim_input(df_history: pd.DataFrame) -> list:
     return out
 
 
-def _call_forecast_api(payload: dict, url: str = 'https://api.nostradamus-api.com/api/v1/forecast/generate_async', timeout: int = 300) -> dict:
+def _aggregate_monthly_sales(df_history: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate daily history to monthly totals.
+
+    - Sums `sales` per (item_id, month)
+    - Sets `sale_date` to the 1st of the month (month start)
+    - Returns a dataframe with columns: item_id, sale_date, sales
+    """
+    if df_history.empty:
+        return df_history
+
+    df = df_history.copy()
+    if 'sale_date' not in df.columns or 'sales' not in df.columns or 'item_id' not in df.columns:
+        return df_history
+
+    df['sale_date'] = pd.to_datetime(df['sale_date'], errors='coerce')
+    df = df[df['sale_date'].notna()].copy()
+    if df.empty:
+        return df
+
+    # Month start timestamp (YYYY-MM-01)
+    # Note: Pandas uses 'M' for monthly periods; 'MS' is a timestamp freq, not a period freq.
+    df['sale_date'] = df['sale_date'].dt.to_period('M').dt.to_timestamp(how='start')
+
+    df = (
+        df.groupby(['item_id', 'sale_date'], as_index=False)['sales']
+        .sum()
+        .sort_values(['item_id', 'sale_date'])
+    )
+    return df
+
+
+def _normalize_localhost_url(url: str) -> str:
+    """Downgrade https->http for localhost URLs (common in Docker dev).
+
+    If you actually run TLS locally, keep using https and remove this.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme == 'https' and (parsed.hostname in {'localhost', '127.0.0.1', '0.0.0.0'}):
+            return urlunparse(parsed._replace(scheme='http'))
+    except Exception:
+        return url
+    return url
+
+
+def _call_forecast_api(payload: dict, url: str = 'http://localhost:8000/api/v1/forecast/generate_async', timeout: int = 300) -> dict:
     """Call the Nostradamus forecasting API and return parsed JSON.
 
     Default URL uses the async endpoint and a longer timeout to avoid origin timeouts.
@@ -49,17 +95,19 @@ def _call_forecast_api(payload: dict, url: str = 'https://api.nostradamus-api.co
     api_key = os.getenv('API_KEY')
     if api_key:
         headers['X-API-Key'] = api_key
+    url = _normalize_localhost_url(url)
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
 
-def _submit_job(payload: dict, base_url: str = 'https://api.nostradamus-api.com', webhook_url: str | None = None, timeout: int = 30) -> dict:
+def _submit_job(payload: dict, base_url: str = 'http://localhost:8000', webhook_url: str | None = None, timeout: int = 30) -> dict:
     """Submit a job to the async generate_job endpoint.
 
     Returns the JSON response which should include `job_id` and `status_url`.
     If `API_KEY` env var is set it will be sent as `X-API-Key` header.
     """
+    base_url = _normalize_localhost_url(base_url)
     # build URL
     url = f"{base_url.rstrip('/')}/api/v1/forecast/generate_job"
     params = {}
@@ -86,6 +134,7 @@ def _poll_job_status(status_url: str, timeout: int = 600, poll_initial: float = 
     if api_key:
         headers['X-API-Key'] = api_key
 
+    status_url = _normalize_localhost_url(status_url)
     deadline = time.time() + timeout
     interval = poll_initial
     while time.time() < deadline:
@@ -351,19 +400,34 @@ def main():
                         'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
                     ], index=0)
                     freq = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
+                    aggregate_monthly = st.checkbox(
+                        "Aggregate to monthly totals",
+                        value=False,
+                        help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as MS.",
+                    )
                     season_length = st.number_input("Season length", min_value=1, max_value=365, value=12)
                     forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
                     quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
                     api_key = st.text_input("TimeGPT API key (optional)", type="password")
-                    api_base_url = st.text_input("Forecast API base URL", value="https://api.nostradamus-api.com")
+                    api_base_url = st.text_input("Forecast API base URL", value="http://localhost:8000")
                     webhook_url = st.text_input("Webhook URL (optional)")
                     wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
+                    poll_timeout_seconds = st.number_input("Polling timeout (s)", min_value=60, max_value=24 * 60 * 60, value=1800)
+                    run_in_batches = st.checkbox("Run in batches", value=True)
+                    batch_size_items = st.number_input("Batch size (items per job)", min_value=1, max_value=5000, value=500)
                     item_selection = st.multiselect("Items to include (leave empty = all items in project)", options=items, default=[])
                     submitted = st.form_submit_button("Run and preview")
 
                 if submitted:
                     # hide the expander after submission
                     st.session_state['_show_project_forecast'] = False
+
+                    normalized = _normalize_localhost_url(api_base_url)
+                    if normalized != api_base_url:
+                        st.warning(f"Using {normalized} (localhost usually doesn't use TLS).")
+                        api_base_url = normalized
+
+                    # Load history once (then split into item batches).
                     con = get_connection()
                     if item_selection:
                         placeholders = ','.join(['?'] * len(item_selection))
@@ -377,10 +441,36 @@ def main():
 
                     if df_hist.empty:
                         st.error("No sales history found for the selected project/items.")
+                        return
+
+                    if aggregate_monthly:
+                        df_hist = _aggregate_monthly_sales(df_hist)
+
+                    item_ids = df_hist['item_id'].dropna().astype(str).unique().tolist()
+                    if not item_ids:
+                        st.error("No valid item_id values found in sales history.")
+                        return
+
+                    if run_in_batches:
+                        n = int(batch_size_items)
+                        item_batches = [item_ids[i:i + n] for i in range(0, len(item_ids), n)]
                     else:
-                        sim_input_his = _format_sim_input(df_hist)
+                        item_batches = [item_ids]
+
+                    st.info(
+                        f"Submitting {len(item_batches)} job(s) for {len(item_ids)} item(s). "
+                        f"(Batching={'on' if run_in_batches else 'off'}, items/job={int(batch_size_items)})"
+                    )
+
+                    progress = st.progress(0)
+                    any_inserted = 0
+                    last_preview_df = pd.DataFrame()
+
+                    for idx, batch_items in enumerate(item_batches, start=1):
+                        df_hist_batch = df_hist[df_hist['item_id'].astype(str).isin(set(map(str, batch_items)))].copy()
+                        sim_input_his = _format_sim_input(df_hist_batch)
                         if len(sim_input_his) < 5:
-                            st.warning("Less than 5 data points — some models may not work well.")
+                            st.warning(f"Batch {idx}: less than 5 data points — some models may not work well.")
 
                         payload = {
                             'sim_input_his': sim_input_his,
@@ -388,7 +478,7 @@ def main():
                             'mode': run_mode,
                             'local_model': local_model,
                             'season_length': int(season_length),
-                            'freq': freq,
+                            'freq': 'MS' if aggregate_monthly else freq,
                         }
                         if quantiles_text.strip():
                             try:
@@ -396,59 +486,73 @@ def main():
                                 payload['quantiles'] = quantiles
                             except Exception:
                                 st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
+                                return
 
                         if run_mode == 'timegpt' and api_key:
                             payload['api_key'] = api_key
 
-                        st.info("Submitting job to forecast API — this may take a while to complete...")
+                        st.write(f"Batch {idx}/{len(item_batches)}: submitting job for {len(batch_items)} item(s)...")
                         try:
                             resp = _submit_job(payload, base_url=api_base_url, webhook_url=webhook_url)
                         except Exception as e:
-                            st.error(f"Job submission failed: {e}")
-                            resp = None
+                            st.error(f"Job submission failed (batch {idx}): {e}")
+                            break
 
-                        if resp:
-                            st.write("Submission result:")
-                            st.json(resp)
-                            status_url = resp.get('status_url') or resp.get('status') or resp.get('status_endpoint')
-                            job_id = resp.get('job_id')
-                            if wait_for_completion and status_url:
-                                try:
-                                    st.info("Polling job status until finished...")
-                                    job = _poll_job_status(status_url, timeout=600)
-                                except Exception as e:
-                                    st.error(f"Polling failed: {e}")
-                                    job = None
+                        status_url = resp.get('status_url') or resp.get('status') or resp.get('status_endpoint')
+                        job_id = resp.get('job_id')
+                        if not status_url:
+                            st.warning(f"Batch {idx}: no status_url returned. job_id={job_id}")
+                            break
 
-                                if job:
-                                    st.write("Final job object:")
-                                    st.json(job)
-                                    if job.get('status') == 'finished' and job.get('result'):
-                                        df_new = _parse_nostradamus_response(job.get('result'), project=project, fm_override=local_model if run_mode=='local' else None)
-                                    elif job.get('status') == 'finished' and not job.get('result'):
-                                        st.warning("Job finished but no result field present in job. Inspect job JSON above.")
-                                        df_new = pd.DataFrame()
-                                    else:
-                                        st.error(f"Job ended with status: {job.get('status')}")
-                                        df_new = pd.DataFrame()
-                                else:
-                                    df_new = pd.DataFrame()
+                        if wait_for_completion:
+                            try:
+                                job = _poll_job_status(status_url, timeout=int(poll_timeout_seconds))
+                            except Exception as e:
+                                st.error(f"Polling failed (batch {idx}): {e}")
+                                break
+
+                            if job.get('status') != 'finished' or not job.get('result'):
+                                st.error(f"Batch {idx}: job ended with status={job.get('status')} error={job.get('error')}")
+                                break
+
+                            df_new = _parse_nostradamus_response(
+                                job.get('result'),
+                                project=project,
+                                fm_override=local_model if run_mode == 'local' else None,
+                            )
+                            if df_new.empty:
+                                st.warning(f"Batch {idx}: parsed 0 forecast rows.")
                             else:
-                                # not waiting — inform user about job id / status url
-                                st.success(f"Job submitted (job_id={job_id}). Poll {status_url} to check status or wait for webhook delivery.")
-                                df_new = pd.DataFrame()
-
-                            if not df_new.empty:
-                                st.write("Preview of forecasts to import:")
-                                st.dataframe(df_new.head(200))
-                                if st.button("Import forecasts into DB"):
-                                    con = get_connection()
+                                # Insert per batch so large runs don't keep everything in memory.
+                                con = get_connection()
+                                try:
                                     fm_name = df_new['forecast_method'].iloc[0]
-                                    con.execute("DELETE FROM forecasts WHERE project = ? AND forecast_method = ?;", [project, fm_name])
-                                    con.register('forecasts_api_df', df_new)
-                                    con.execute("INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df")
+                                    # delete only this batch's items for safety
+                                    placeholders_items = ','.join(['?'] * len(batch_items))
+                                    delete_sql = f"DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id IN ({placeholders_items})"
+                                    con.execute(delete_sql, [project, fm_name, *map(str, batch_items)])
+                                    con.register('forecasts_api_df_batch', df_new)
+                                    con.execute(
+                                        'INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) '
+                                        'SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_batch'
+                                    )
+                                finally:
                                     con.close()
-                                    st.success(f"Imported {len(df_new)} forecast rows into forecasts table (method={fm_name}).")
+
+                                any_inserted += len(df_new)
+                                last_preview_df = df_new
+                                st.success(f"Batch {idx}: inserted {len(df_new)} rows.")
+
+                        else:
+                            st.success(f"Batch {idx}: submitted job_id={job_id}. (Not waiting for completion)")
+
+                        progress.progress(int(idx / len(item_batches) * 100))
+
+                    if any_inserted > 0:
+                        st.success(f"Inserted {any_inserted} forecast rows total.")
+                        if not last_preview_df.empty:
+                            st.write("Preview (last batch):")
+                            st.dataframe(last_preview_df.head(200))
 
     history, forecasts, combined = load_series(project, item_id, selected_methods)
     metrics_df = load_metrics(project, item_id, selected_methods)
@@ -468,11 +572,17 @@ def main():
                     'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
                 ], index=0)
                 freq = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
+                aggregate_monthly = st.checkbox(
+                    "Aggregate to monthly totals",
+                    value=False,
+                    help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as MS.",
+                )
                 season_length = st.number_input("Season length", min_value=1, max_value=365, value=12)
                 forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
                 quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
                 api_key = st.text_input("TimeGPT API key (optional)", type="password")
                 timeout_seconds = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300)
+                poll_timeout_seconds = st.number_input("Polling timeout (s)", min_value=60, max_value=24 * 60 * 60, value=1800)
                 submitted_item = st.form_submit_button("Run and preview")
 
             if submitted_item:
@@ -485,6 +595,8 @@ def main():
                 if df_hist_item.empty:
                     st.error("No sales history found for this item.")
                 else:
+                    if aggregate_monthly:
+                        df_hist_item = _aggregate_monthly_sales(df_hist_item)
                     sim_input_his = _format_sim_input(df_hist_item)
                     if len(sim_input_his) < 1:
                         st.error("No valid sale_date rows to send. Check your data.")
@@ -495,7 +607,7 @@ def main():
                             'mode': run_mode,
                             'local_model': local_model,
                             'season_length': int(season_length),
-                            'freq': freq,
+                            'freq': 'MS' if aggregate_monthly else freq,
                         }
                         if quantiles_text.strip():
                             try:
@@ -508,9 +620,14 @@ def main():
                             payload['api_key'] = api_key
 
                         # additional fields for async job submission
-                        api_base_url = st.text_input("Forecast API base URL", value="https://api.nostradamus-api.com")
+                        api_base_url = st.text_input("Forecast API base URL", value="http://localhost:8000")
                         webhook_url = st.text_input("Webhook URL (optional)")
                         wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
+
+                        normalized = _normalize_localhost_url(api_base_url)
+                        if normalized != api_base_url:
+                            st.warning(f"Using {normalized} (localhost usually doesn't use TLS).")
+                            api_base_url = normalized
 
                         st.info("Submitting job to forecast API — this may take a short while...")
                         try:
@@ -527,7 +644,7 @@ def main():
                             if wait_for_completion and status_url:
                                 try:
                                     st.info("Polling job status until finished...")
-                                    job = _poll_job_status(status_url, timeout=600)
+                                    job = _poll_job_status(status_url, timeout=int(poll_timeout_seconds))
                                 except Exception as e:
                                     st.error(f"Polling failed: {e}")
                                     job = None
