@@ -71,6 +71,26 @@ def _aggregate_monthly_sales(df_history: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _aggregate_monthly_history_series(history_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate chart history series to monthly totals (month start dates)."""
+    if history_df is None or history_df.empty:
+        return pd.DataFrame(columns=["date", "value", "series"])
+
+    df = history_df.copy()
+    if 'date' not in df.columns or 'value' not in df.columns:
+        return pd.DataFrame(columns=["date", "value", "series"])
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df[df['date'].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["date", "value", "series"])
+
+    df['date'] = df['date'].dt.to_period('M').dt.to_timestamp(how='start')
+    df = df.groupby(['date'], as_index=False)['value'].sum()
+    df['series'] = 'History (Monthly)'
+    return df
+
+
 def _normalize_localhost_url(url: str) -> str:
     """Downgrade https->http for localhost URLs (common in Docker dev).
 
@@ -383,194 +403,27 @@ def main():
         default=methods  # select all by default
     )
 
-    # --- Forecast generation UI (project-level) ---
-    st.markdown("---")
-    gen_col1, gen_col2 = st.columns([1, 1])
-    with gen_col2:
-        # Use session state to emulate a modal when Streamlit doesn't support `st.modal` in this runtime
-        if st.button("Generate forecasts for project"):
-            st.session_state['_show_project_forecast'] = True
+    st.sidebar.markdown("---")
 
-        if st.session_state.get('_show_project_forecast'):
-            with st.expander("Generate forecasts", expanded=True):
-                st.write("Set forecast parameters and run for selected project/item(s)")
-                with st.form("forecast_form"):
-                    run_mode = st.selectbox("Mode", options=["local", "timegpt"], index=0)
-                    local_model = st.selectbox("Local model", options=[
-                        'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
-                    ], index=0)
-                    freq = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
-                    aggregate_monthly = st.checkbox(
-                        "Aggregate to monthly totals",
-                        value=False,
-                        help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as MS.",
-                    )
-                    season_length = st.number_input("Season length", min_value=1, max_value=365, value=12)
-                    forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
-                    quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
-                    api_key = st.text_input("TimeGPT API key (optional)", type="password")
-                    api_base_url = st.text_input("Forecast API base URL", value="http://localhost:8000")
-                    webhook_url = st.text_input("Webhook URL (optional)")
-                    wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
-                    poll_timeout_seconds = st.number_input("Polling timeout (s)", min_value=60, max_value=24 * 60 * 60, value=1800)
-                    run_in_batches = st.checkbox("Run in batches", value=True)
-                    batch_size_items = st.number_input("Batch size (items per job)", min_value=1, max_value=5000, value=500)
-                    item_selection = st.multiselect("Items to include (leave empty = all items in project)", options=items, default=[])
-                    submitted = st.form_submit_button("Run and preview")
+    # --- Project forecast section (button + parameters directly underneath) ---
+    if st.sidebar.button("Generate forecasts for project"):
+        next_open = not bool(st.session_state.get('_show_project_forecast', False))
+        st.session_state['_show_project_forecast'] = next_open
+        if next_open:
+            st.session_state['_show_item_forecast'] = False
 
-                if submitted:
-                    # hide the expander after submission
-                    st.session_state['_show_project_forecast'] = False
-
-                    normalized = _normalize_localhost_url(api_base_url)
-                    if normalized != api_base_url:
-                        st.warning(f"Using {normalized} (localhost usually doesn't use TLS).")
-                        api_base_url = normalized
-
-                    # Load history once (then split into item batches).
-                    con = get_connection()
-                    if item_selection:
-                        placeholders = ','.join(['?'] * len(item_selection))
-                        sql = f"SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? AND item_id IN ({placeholders}) ORDER BY item_id, sale_date"
-                        params = [project, *item_selection]
-                    else:
-                        sql = "SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? ORDER BY item_id, sale_date"
-                        params = [project]
-                    df_hist = con.execute(sql, params).fetchdf()
-                    con.close()
-
-                    if df_hist.empty:
-                        st.error("No sales history found for the selected project/items.")
-                        return
-
-                    if aggregate_monthly:
-                        df_hist = _aggregate_monthly_sales(df_hist)
-
-                    item_ids = df_hist['item_id'].dropna().astype(str).unique().tolist()
-                    if not item_ids:
-                        st.error("No valid item_id values found in sales history.")
-                        return
-
-                    if run_in_batches:
-                        n = int(batch_size_items)
-                        item_batches = [item_ids[i:i + n] for i in range(0, len(item_ids), n)]
-                    else:
-                        item_batches = [item_ids]
-
-                    st.info(
-                        f"Submitting {len(item_batches)} job(s) for {len(item_ids)} item(s). "
-                        f"(Batching={'on' if run_in_batches else 'off'}, items/job={int(batch_size_items)})"
-                    )
-
-                    progress = st.progress(0)
-                    any_inserted = 0
-                    last_preview_df = pd.DataFrame()
-
-                    for idx, batch_items in enumerate(item_batches, start=1):
-                        df_hist_batch = df_hist[df_hist['item_id'].astype(str).isin(set(map(str, batch_items)))].copy()
-                        sim_input_his = _format_sim_input(df_hist_batch)
-                        if len(sim_input_his) < 5:
-                            st.warning(f"Batch {idx}: less than 5 data points — some models may not work well.")
-
-                        payload = {
-                            'sim_input_his': sim_input_his,
-                            'forecast_periods': int(forecast_periods),
-                            'mode': run_mode,
-                            'local_model': local_model,
-                            'season_length': int(season_length),
-                            'freq': 'MS' if aggregate_monthly else freq,
-                        }
-                        if quantiles_text.strip():
-                            try:
-                                quantiles = [float(q.strip()) for q in quantiles_text.split(',') if q.strip()]
-                                payload['quantiles'] = quantiles
-                            except Exception:
-                                st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
-                                return
-
-                        if run_mode == 'timegpt' and api_key:
-                            payload['api_key'] = api_key
-
-                        st.write(f"Batch {idx}/{len(item_batches)}: submitting job for {len(batch_items)} item(s)...")
-                        try:
-                            resp = _submit_job(payload, base_url=api_base_url, webhook_url=webhook_url)
-                        except Exception as e:
-                            st.error(f"Job submission failed (batch {idx}): {e}")
-                            break
-
-                        status_url = resp.get('status_url') or resp.get('status') or resp.get('status_endpoint')
-                        job_id = resp.get('job_id')
-                        if not status_url:
-                            st.warning(f"Batch {idx}: no status_url returned. job_id={job_id}")
-                            break
-
-                        if wait_for_completion:
-                            try:
-                                job = _poll_job_status(status_url, timeout=int(poll_timeout_seconds))
-                            except Exception as e:
-                                st.error(f"Polling failed (batch {idx}): {e}")
-                                break
-
-                            if job.get('status') != 'finished' or not job.get('result'):
-                                st.error(f"Batch {idx}: job ended with status={job.get('status')} error={job.get('error')}")
-                                break
-
-                            df_new = _parse_nostradamus_response(
-                                job.get('result'),
-                                project=project,
-                                fm_override=local_model if run_mode == 'local' else None,
-                            )
-                            if df_new.empty:
-                                st.warning(f"Batch {idx}: parsed 0 forecast rows.")
-                            else:
-                                # Insert per batch so large runs don't keep everything in memory.
-                                con = get_connection()
-                                try:
-                                    fm_name = df_new['forecast_method'].iloc[0]
-                                    # delete only this batch's items for safety
-                                    placeholders_items = ','.join(['?'] * len(batch_items))
-                                    delete_sql = f"DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id IN ({placeholders_items})"
-                                    con.execute(delete_sql, [project, fm_name, *map(str, batch_items)])
-                                    con.register('forecasts_api_df_batch', df_new)
-                                    con.execute(
-                                        'INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) '
-                                        'SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_batch'
-                                    )
-                                finally:
-                                    con.close()
-
-                                any_inserted += len(df_new)
-                                last_preview_df = df_new
-                                st.success(f"Batch {idx}: inserted {len(df_new)} rows.")
-
-                        else:
-                            st.success(f"Batch {idx}: submitted job_id={job_id}. (Not waiting for completion)")
-
-                        progress.progress(int(idx / len(item_batches) * 100))
-
-                    if any_inserted > 0:
-                        st.success(f"Inserted {any_inserted} forecast rows total.")
-                        if not last_preview_df.empty:
-                            st.write("Preview (last batch):")
-                            st.dataframe(last_preview_df.head(200))
-
-    history, forecasts, combined = load_series(project, item_id, selected_methods)
-    metrics_df = load_metrics(project, item_id, selected_methods)
-
-    st.subheader(f"Item: {item_id} — Project: {project}")
-
-    # Per-item forecast: open modal to send only this item's history to the async API
-    if st.button("Generate forecast for this item"):
-        st.session_state['_show_item_forecast'] = True
-
-    if st.session_state.get('_show_item_forecast'):
-        with st.expander("Generate forecast for item", expanded=True):
-            st.write(f"Project: {project} — Item: {item_id}")
-            with st.form("forecast_item_form"):
+    if st.session_state.get('_show_project_forecast'):
+        with st.sidebar.container():
+            st.markdown("**Project forecast parameters**")
+            with st.form("forecast_form"):
                 run_mode = st.selectbox("Mode", options=["local", "timegpt"], index=0)
-                local_model = st.selectbox("Local model", options=[
-                    'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
-                ], index=0)
+                local_model = st.selectbox(
+                    "Local model",
+                    options=[
+                        'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
+                    ],
+                    index=0,
+                )
                 freq = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
                 aggregate_monthly = st.checkbox(
                     "Aggregate to monthly totals",
@@ -581,103 +434,312 @@ def main():
                 forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
                 quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
                 api_key = st.text_input("TimeGPT API key (optional)", type="password")
-                timeout_seconds = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300)
-                poll_timeout_seconds = st.number_input("Polling timeout (s)", min_value=60, max_value=24 * 60 * 60, value=1800)
-                submitted_item = st.form_submit_button("Run and preview")
+                api_base_url = st.text_input("Forecast API base URL", value="http://localhost:8000")
+                webhook_url = st.text_input("Webhook URL (optional)")
+                wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
+                poll_timeout_seconds = st.number_input(
+                    "Polling timeout (s)",
+                    min_value=60,
+                    max_value=24 * 60 * 60,
+                    value=1800,
+                )
+                run_in_batches = st.checkbox("Run in batches", value=True)
+                batch_size_items = st.number_input("Batch size (items per job)", min_value=1, max_value=5000, value=500)
+                item_selection = st.multiselect(
+                    "Items to include (leave empty = all items in project)",
+                    options=items,
+                    default=[],
+                )
+                submitted = st.form_submit_button("Batch run")
+
+            if submitted:
+                st.session_state['_show_project_forecast'] = False
+                st.session_state['_project_forecast_request'] = {
+                    'project': project,
+                    'run_mode': run_mode,
+                    'local_model': local_model,
+                    'freq': freq,
+                    'aggregate_monthly': bool(aggregate_monthly),
+                    'season_length': int(season_length),
+                    'forecast_periods': int(forecast_periods),
+                    'quantiles_text': quantiles_text,
+                    'api_key': api_key,
+                    'api_base_url': api_base_url,
+                    'webhook_url': webhook_url,
+                    'wait_for_completion': bool(wait_for_completion),
+                    'poll_timeout_seconds': int(poll_timeout_seconds),
+                    'run_in_batches': bool(run_in_batches),
+                    'batch_size_items': int(batch_size_items),
+                    'item_selection': item_selection,
+                }
+                st.rerun()
+
+    # --- Item forecast section (button + parameters directly underneath) ---
+    if st.sidebar.button("Generate forecast for this item"):
+        next_open = not bool(st.session_state.get('_show_item_forecast', False))
+        st.session_state['_show_item_forecast'] = next_open
+        if next_open:
+            st.session_state['_show_project_forecast'] = False
+
+    if st.session_state.get('_show_item_forecast'):
+        with st.sidebar.container():
+            st.markdown("**Item forecast parameters**")
+            with st.form("forecast_item_form"):
+                run_mode_item = st.selectbox("Mode", options=["local", "timegpt"], index=0)
+                local_model_item = st.selectbox(
+                    "Local model",
+                    options=[
+                        'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
+                    ],
+                    index=0,
+                )
+                freq_item = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
+                aggregate_monthly_item = st.checkbox(
+                    "Aggregate to monthly totals",
+                    value=False,
+                    help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as MS.",
+                )
+                season_length_item = st.number_input("Season length", min_value=1, max_value=365, value=12)
+                forecast_periods_item = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
+                quantiles_text_item = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
+                api_key_item = st.text_input("TimeGPT API key (optional)", type="password")
+                api_base_url_item = st.text_input("Forecast API base URL", value="http://localhost:8000")
+                timeout_seconds_item = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300)
+                submitted_item = st.form_submit_button("Single run")
 
             if submitted_item:
-                con = get_connection()
-                sql = "SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? AND item_id = ? ORDER BY sale_date"
-                params = [project, item_id]
-                df_hist_item = con.execute(sql, params).fetchdf()
-                con.close()
+                st.session_state['_show_item_forecast'] = False
+                st.session_state['_item_forecast_request'] = {
+                    'project': project,
+                    'item_id': item_id,
+                    'run_mode': run_mode_item,
+                    'local_model': local_model_item,
+                    'freq': freq_item,
+                    'aggregate_monthly': bool(aggregate_monthly_item),
+                    'season_length': int(season_length_item),
+                    'forecast_periods': int(forecast_periods_item),
+                    'quantiles_text': quantiles_text_item,
+                    'api_key': api_key_item,
+                    'api_base_url': api_base_url_item,
+                    'timeout_seconds': int(timeout_seconds_item),
+                }
+                st.rerun()
 
-                if df_hist_item.empty:
-                    st.error("No sales history found for this item.")
+    # --- Forecast execution (main area) ---
+    project_req = st.session_state.pop('_project_forecast_request', None)
+    if project_req:
+        st.markdown('---')
+        st.subheader('Project forecast run')
+
+        api_base_url = _normalize_localhost_url(project_req['api_base_url'])
+        if api_base_url != project_req['api_base_url']:
+            st.warning(f"Using {api_base_url} (localhost usually doesn't use TLS).")
+
+        # Load history once (then split into item batches).
+        con = get_connection()
+        if project_req['item_selection']:
+            placeholders = ','.join(['?'] * len(project_req['item_selection']))
+            sql = f"SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? AND item_id IN ({placeholders}) ORDER BY item_id, sale_date"
+            params = [project_req['project'], *project_req['item_selection']]
+        else:
+            sql = "SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? ORDER BY item_id, sale_date"
+            params = [project_req['project']]
+        df_hist = con.execute(sql, params).fetchdf()
+        con.close()
+
+        if df_hist.empty:
+            st.error("No sales history found for the selected project/items.")
+        else:
+            if project_req['aggregate_monthly']:
+                df_hist = _aggregate_monthly_sales(df_hist)
+
+            item_ids = df_hist['item_id'].dropna().astype(str).unique().tolist()
+            if not item_ids:
+                st.error("No valid item_id values found in sales history.")
+            else:
+                if project_req['run_in_batches']:
+                    n = int(project_req['batch_size_items'])
+                    item_batches = [item_ids[i:i + n] for i in range(0, len(item_ids), n)]
                 else:
-                    if aggregate_monthly:
-                        df_hist_item = _aggregate_monthly_sales(df_hist_item)
-                    sim_input_his = _format_sim_input(df_hist_item)
-                    if len(sim_input_his) < 1:
-                        st.error("No valid sale_date rows to send. Check your data.")
-                    else:
-                        payload = {
-                            'sim_input_his': sim_input_his,
-                            'forecast_periods': int(forecast_periods),
-                            'mode': run_mode,
-                            'local_model': local_model,
-                            'season_length': int(season_length),
-                            'freq': 'MS' if aggregate_monthly else freq,
-                        }
-                        if quantiles_text.strip():
-                            try:
-                                quantiles = [float(q.strip()) for q in quantiles_text.split(',') if q.strip()]
-                                payload['quantiles'] = quantiles
-                            except Exception:
-                                st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
+                    item_batches = [item_ids]
 
-                        if run_mode == 'timegpt' and api_key:
-                            payload['api_key'] = api_key
+                st.info(
+                    f"Submitting {len(item_batches)} job(s) for {len(item_ids)} item(s). "
+                    f"(Batching={'on' if project_req['run_in_batches'] else 'off'}, items/job={int(project_req['batch_size_items'])})"
+                )
 
-                        # additional fields for async job submission
-                        api_base_url = st.text_input("Forecast API base URL", value="http://localhost:8000")
-                        webhook_url = st.text_input("Webhook URL (optional)")
-                        wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
+                progress = st.progress(0)
+                any_inserted = 0
 
-                        normalized = _normalize_localhost_url(api_base_url)
-                        if normalized != api_base_url:
-                            st.warning(f"Using {normalized} (localhost usually doesn't use TLS).")
-                            api_base_url = normalized
+                for idx, batch_items in enumerate(item_batches, start=1):
+                    df_hist_batch = df_hist[df_hist['item_id'].astype(str).isin(set(map(str, batch_items)))].copy()
+                    sim_input_his = _format_sim_input(df_hist_batch)
+                    if len(sim_input_his) < 5:
+                        st.warning(f"Batch {idx}: less than 5 data points — some models may not work well.")
 
-                        st.info("Submitting job to forecast API — this may take a short while...")
+                    payload = {
+                        'sim_input_his': sim_input_his,
+                        'forecast_periods': int(project_req['forecast_periods']),
+                        'mode': project_req['run_mode'],
+                        'local_model': project_req['local_model'],
+                        'season_length': int(project_req['season_length']),
+                        'freq': 'MS' if project_req['aggregate_monthly'] else project_req['freq'],
+                    }
+                    if project_req['quantiles_text'].strip():
                         try:
-                            resp = _submit_job(payload, base_url=api_base_url, webhook_url=webhook_url, timeout=timeout_seconds)
+                            quantiles = [float(q.strip()) for q in project_req['quantiles_text'].split(',') if q.strip()]
+                            payload['quantiles'] = quantiles
+                        except Exception:
+                            st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
+                            break
+
+                    if project_req['run_mode'] == 'timegpt' and project_req['api_key']:
+                        payload['api_key'] = project_req['api_key']
+
+                    st.write(f"Batch {idx}/{len(item_batches)}: submitting job for {len(batch_items)} item(s)...")
+                    try:
+                        resp = _submit_job(payload, base_url=api_base_url, webhook_url=project_req['webhook_url'])
+                    except Exception as e:
+                        st.error(f"Job submission failed (batch {idx}): {e}")
+                        break
+
+                    status_url = resp.get('status_url') or resp.get('status') or resp.get('status_endpoint')
+                    job_id = resp.get('job_id')
+                    if not status_url:
+                        st.warning(f"Batch {idx}: no status_url returned. job_id={job_id}")
+                        break
+
+                    if project_req['wait_for_completion']:
+                        try:
+                            job = _poll_job_status(status_url, timeout=int(project_req['poll_timeout_seconds']))
                         except Exception as e:
-                            st.error(f"Job submission failed: {e}")
-                            resp = None
+                            st.error(f"Polling failed (batch {idx}): {e}")
+                            break
 
-                        if resp:
-                            st.write("Submission result:")
-                            st.json(resp)
-                            status_url = resp.get('status_url') or resp.get('status') or resp.get('status_endpoint')
-                            job_id = resp.get('job_id')
-                            if wait_for_completion and status_url:
-                                try:
-                                    st.info("Polling job status until finished...")
-                                    job = _poll_job_status(status_url, timeout=int(poll_timeout_seconds))
-                                except Exception as e:
-                                    st.error(f"Polling failed: {e}")
-                                    job = None
+                        if job.get('status') != 'finished' or not job.get('result'):
+                            st.error(f"Batch {idx}: job ended with status={job.get('status')} error={job.get('error')}")
+                            break
 
-                                if job:
-                                    st.write("Final job object:")
-                                    st.json(job)
-                                    if job.get('status') == 'finished' and job.get('result'):
-                                        df_new = _parse_nostradamus_response(job.get('result'), project=project, fm_override=local_model if run_mode=='local' else None)
-                                    elif job.get('status') == 'finished' and not job.get('result'):
-                                        st.warning("Job finished but no result field present in job. Inspect job JSON above.")
-                                        df_new = pd.DataFrame()
-                                    else:
-                                        st.error(f"Job ended with status: {job.get('status')}")
-                                        df_new = pd.DataFrame()
-                                else:
-                                    df_new = pd.DataFrame()
-                            else:
-                                st.success(f"Job submitted (job_id={job_id}). Poll {status_url} to check status or wait for webhook delivery.")
-                                df_new = pd.DataFrame()
+                        df_new = _parse_nostradamus_response(
+                            job.get('result'),
+                            project=project_req['project'],
+                            fm_override=project_req['local_model'] if project_req['run_mode'] == 'local' else None,
+                        )
+                        if df_new.empty:
+                            st.warning(f"Batch {idx}: parsed 0 forecast rows.")
+                        else:
+                            con = get_connection()
+                            try:
+                                fm_name = df_new['forecast_method'].iloc[0]
+                                placeholders_items = ','.join(['?'] * len(batch_items))
+                                delete_sql = f"DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id IN ({placeholders_items})"
+                                con.execute(delete_sql, [project_req['project'], fm_name, *map(str, batch_items)])
+                                con.register('forecasts_api_df_batch', df_new)
+                                con.execute(
+                                    'INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) '
+                                    'SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_batch'
+                                )
+                            finally:
+                                con.close()
 
-                            if not df_new.empty:
-                                st.write("Preview of forecasts to import:")
-                                st.dataframe(df_new.head(200))
-                                if st.button("Import forecasts into DB"):
-                                    con = get_connection()
-                                    fm_name = df_new['forecast_method'].iloc[0]
-                                    # delete only this item for safety
-                                    con.execute("DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id = ?", [project, fm_name, item_id])
-                                    con.register('forecasts_api_df_item', df_new)
-                                    con.execute("INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item")
-                                    con.close()
-                                    st.success(f"Imported {len(df_new)} forecast rows into forecasts table (method={fm_name}).")
+                            any_inserted += len(df_new)
+                            st.success(f"Batch {idx}: inserted {len(df_new)} rows.")
+                    else:
+                        st.success(f"Batch {idx}: submitted job_id={job_id}. (Not waiting for completion)")
+
+                    progress.progress(int(idx / len(item_batches) * 100))
+
+                if any_inserted > 0:
+                    st.success(f"Inserted {any_inserted} forecast rows total.")
+
+    history, forecasts, combined = load_series(project, item_id, selected_methods)
+    metrics_df = load_metrics(project, item_id, selected_methods)
+
+    st.subheader(f"Item: {item_id} — Project: {project}")
+
+    item_req = st.session_state.pop('_item_forecast_request', None)
+    if item_req:
+        st.markdown('---')
+        st.subheader('Item forecast run')
+
+        con = get_connection()
+        sql = "SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? AND item_id = ? ORDER BY sale_date"
+        params = [item_req['project'], item_req['item_id']]
+        df_hist_item = con.execute(sql, params).fetchdf()
+        con.close()
+
+        if df_hist_item.empty:
+            st.error("No sales history found for this item.")
+        else:
+            if item_req['aggregate_monthly']:
+                df_hist_item = _aggregate_monthly_sales(df_hist_item)
+
+            sim_input_his = _format_sim_input(df_hist_item)
+            if len(sim_input_his) < 1:
+                st.error("No valid sale_date rows to send. Check your data.")
+            else:
+                payload = {
+                    'sim_input_his': sim_input_his,
+                    'forecast_periods': int(item_req['forecast_periods']),
+                    'mode': item_req['run_mode'],
+                    'local_model': item_req['local_model'],
+                    'season_length': int(item_req['season_length']),
+                    'freq': 'MS' if item_req['aggregate_monthly'] else item_req['freq'],
+                }
+                if item_req['quantiles_text'].strip():
+                    try:
+                        quantiles = [float(q.strip()) for q in item_req['quantiles_text'].split(',') if q.strip()]
+                        payload['quantiles'] = quantiles
+                    except Exception:
+                        st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
+                        payload = None
+
+                if payload is not None:
+                    if item_req['run_mode'] == 'timegpt' and item_req['api_key']:
+                        payload['api_key'] = item_req['api_key']
+
+                    api_base_url_item = _normalize_localhost_url(item_req['api_base_url'])
+                    if api_base_url_item != item_req['api_base_url']:
+                        st.warning(f"Using {api_base_url_item} (localhost usually doesn't use TLS).")
+
+                    url = f"{api_base_url_item.rstrip('/')}/api/v1/forecast/generate"
+                    st.info("Calling forecast API (synchronous) — should be quick for one item...")
+                    try:
+                        resp = _call_forecast_api(payload, url=url, timeout=int(item_req['timeout_seconds']))
+                    except Exception as e:
+                        st.error(f"Forecast call failed: {e}")
+                        resp = None
+
+                    if resp:
+                        st.write("Response:")
+                        st.json(resp)
+                        df_new = _parse_nostradamus_response(
+                            resp,
+                            project=item_req['project'],
+                            fm_override=item_req['local_model'] if item_req['run_mode'] == 'local' else None,
+                        )
+
+                        if df_new.empty:
+                            st.warning("Could not parse any forecast rows from response.")
+                        else:
+                            st.write("Preview of forecasts to import:")
+                            st.dataframe(df_new.head(200))
+                            if st.button("Import forecasts into DB"):
+                                con = get_connection()
+                                fm_name = df_new['forecast_method'].iloc[0]
+                                con.execute(
+                                    "DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id = ?",
+                                    [item_req['project'], fm_name, item_req['item_id']],
+                                )
+                                con.register('forecasts_api_df_item', df_new)
+                                con.execute(
+                                    "INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) "
+                                    "SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item"
+                                )
+                                con.close()
+                                st.success(f"Imported {len(df_new)} forecast rows into forecasts table (method={fm_name}).")
+
+    # (item-level parameter form lives in the sidebar)
 
     # Date range controls (by month) - placed near chart
     st.markdown("---")
@@ -710,9 +772,21 @@ def main():
     start_date = (first_of_current_month - timedelta(days=30*months_back)).date()
     end_date = (first_of_current_month + timedelta(days=30*months_forward + 30)).date()  # Add buffer for end of period
 
+    show_monthly_history = st.checkbox(
+        "Show monthly aggregated history",
+        value=True,
+        help="Overlays a monthly-summed history series dated to the 1st of each month.",
+    )
+
+    combined_for_chart = combined.copy()
+    if show_monthly_history:
+        monthly_hist = _aggregate_monthly_history_series(history)
+        if not monthly_hist.empty:
+            combined_for_chart = pd.concat([combined_for_chart, monthly_hist], ignore_index=True)
+
     # Filter data by date range
-    combined['date'] = pd.to_datetime(combined['date'])
-    combined_filtered = combined[(combined['date'].dt.date >= start_date) & (combined['date'].dt.date <= end_date)]
+    combined_for_chart['date'] = pd.to_datetime(combined_for_chart['date'])
+    combined_filtered = combined_for_chart[(combined_for_chart['date'].dt.date >= start_date) & (combined_for_chart['date'].dt.date <= end_date)]
     
     history_filtered = history[(pd.to_datetime(history['date']).dt.date >= start_date) & (pd.to_datetime(history['date']).dt.date <= end_date)]
     forecasts_filtered = forecasts[(pd.to_datetime(forecasts['date']).dt.date >= start_date) & (pd.to_datetime(forecasts['date']).dt.date <= end_date)]
@@ -740,17 +814,31 @@ def main():
     )
     
     # Main chart
+    # Legend click toggles each series on/off, while keeping all legend entries.
+    series_domain = sorted([s for s in combined_filtered['series'].dropna().unique().tolist()])
+    series_sel = alt.selection_point(
+        fields=["series"],
+        bind="legend",
+        # Click toggles membership (no need for shift-click). Using string for compatibility.
+        toggle="true",
+        # Start with everything visible. Clicking a legend item toggles it off/on.
+        value=[{"series": s} for s in series_domain],
+        # If everything is toggled off, show nothing (but legend remains).
+        empty="none",
+    )
+
     chart = (
         alt.Chart(combined_filtered)
         .mark_line(point=True)
+        .transform_filter(series_sel)
         .encode(
-            x="date:T",
-            y="value:Q",
-            color="series:N",
-            tooltip=["series", "date", "value"]
+            x=alt.X("date:T"),
+            y=alt.Y("value:Q"),
+            color=alt.Color("series:N", scale=alt.Scale(domain=series_domain)),
+            tooltip=["series", "date", "value"],
         )
         .properties(height=400)
-        .interactive()
+        .add_params(series_sel)
     )
     
     # Layer background and chart
