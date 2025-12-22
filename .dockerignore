@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+.DS_Store
+
+# Do not bake runtime data into the image
+Data/
+data/
+benchmark.duckdb
+
+# Local artifacts
+*.log

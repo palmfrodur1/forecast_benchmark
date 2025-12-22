@@ -1,8 +1,10 @@
 # db.py
+import os
 import duckdb
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "benchmark.duckdb"
+_DEFAULT_DB_PATH = Path(__file__).parent / "benchmark.duckdb"
+DB_PATH = Path(os.getenv("BENCHMARK_DB_PATH", str(_DEFAULT_DB_PATH)))
 
 def get_connection():
     con = duckdb.connect(str(DB_PATH))

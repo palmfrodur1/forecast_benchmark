@@ -1,9 +1,10 @@
 # ingest.py
 import pandas as pd
+import os
 from pathlib import Path
 from db import get_connection
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(os.getenv("BENCHMARK_DATA_DIR", str(Path(__file__).parent / "Data")))
 
 def import_sales_history(csv_path: Path):
     df = pd.read_csv(csv_path, sep=';')
