@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from db import get_connection
 import pandas as pd
+from timing_utils import log, start_timer
 
 
 def _format_sim_input(df_history: pd.DataFrame) -> list:
@@ -116,7 +117,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--project', default='BMV_v1')
     parser.add_argument('--item-id', required=True)
-    parser.add_argument('--api-url', default='https://localhost:8000/api/v1/forecast/generate_async')
+    parser.add_argument('--api-url', default='https://api.nostradamus-api.com/api/v1/forecast/generate_async')
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--retries', type=int, default=3)
     parser.add_argument('--season-length', type=int, default=12)
@@ -126,9 +127,13 @@ def main():
     parser.add_argument('--local-only', action='store_true', help='Do not call remote API; compute local forecast only')
     args = parser.parse_args()
 
+    run_start = start_timer()
+    log("Starting item forecast run")
+
     PROJECT = args.project
     ITEM = args.item_id
     API_URL = args.api_url
+    log(f"Project={PROJECT} item_id={ITEM} api_url={API_URL}", since=run_start)
 
     # fetch history for this item
     con = get_connection()
@@ -137,10 +142,11 @@ def main():
     con.close()
 
     if df_hist.empty:
-        print(f"No sales history found for project {PROJECT}, item {ITEM}. Aborting.")
+        log(f"No sales history found for project {PROJECT}, item {ITEM}. Aborting.", since=run_start)
         raise SystemExit(1)
 
     sim_input_his = _format_sim_input(df_hist)
+    log(f"Prepared sim_input_his with {len(sim_input_his)} rows.", since=run_start)
     payload = {
         'sim_input_his': sim_input_his,
         'forecast_periods': args.forecast_periods,
@@ -154,53 +160,58 @@ def main():
     if not args.local_only:
         for attempt in range(1, args.retries + 1):
             try:
-                print(f"Calling API for item {ITEM} (attempt {attempt}/{args.retries})...")
+                api_attempt_start = start_timer()
+                log(f"Calling API (attempt {attempt}/{args.retries})...", since=run_start)
                 r = requests.post(API_URL, json=payload, timeout=args.timeout)
-                print(f"HTTP {r.status_code}")
+                log(f"HTTP {r.status_code}", since=api_attempt_start)
                 if r.status_code != 200:
                     print(r.text[:1000])
                     raise RuntimeError(f"HTTP {r.status_code}")
                 resp_json = r.json()
+                log("API call succeeded.", since=api_attempt_start)
                 break
             except Exception as e:
-                print(f"API request attempt {attempt} failed: {e}")
+                log(f"API request attempt {attempt} failed: {e}", since=run_start)
                 if attempt < args.retries:
                     sleep = 5 * (2 ** (attempt - 1))
-                    print(f"Retrying after {sleep}s...")
+                    log(f"Retrying after {sleep}s...", since=run_start)
                     time.sleep(sleep)
                 else:
-                    print("All remote attempts failed.")
+                    log("All remote attempts failed.", since=run_start)
     else:
-        print("Skipping remote API call (local-only mode)")
+        log("Skipping remote API call (local-only mode)", since=run_start)
 
     out_path = Path(f"/tmp/nostradamus_response_item_{ITEM}.json")
     df_new = None
     if resp_json is not None:
         with out_path.open('w') as f:
             json.dump(resp_json, f, indent=2)
-        print(f"Saved response to {out_path}")
+        log(f"Saved response to {out_path}", since=run_start)
         df_new = _parse_nostradamus_response(resp_json, project=PROJECT, fm_override='auto_arima')
 
     if (df_new is None or df_new.empty) and args.local_fallback:
-        print("Falling back to local seasonal_mean method.")
+        log("Falling back to local seasonal_mean method.", since=run_start)
         df_new = local_seasonal_mean(df_hist, season_length=args.season_length, periods=args.forecast_periods, freq=args.freq, project=PROJECT, item_id=ITEM)
 
     if df_new is None or df_new.empty:
-        print("No forecasts available (remote failed and no local fallback). Exiting.")
+        log("No forecasts available (remote failed and no local fallback). Exiting.", since=run_start)
         raise SystemExit(1)
 
     # insert into DB (delete existing for this project+method+item)
+    run_tag = time.strftime('%Y%m%d_%H%M%S')
+    df_new = df_new.copy()
+    df_new['forecast_method'] = df_new['forecast_method'].astype(str) + '@' + run_tag
     fm_name = df_new['forecast_method'].iloc[0]
+    db_start = start_timer()
     con = get_connection()
     try:
-        delete_sql = "DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id = ?"
-        con.execute(delete_sql, [PROJECT, fm_name, ITEM])
         con.register('forecasts_item_df', df_new)
         con.execute('INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_item_df')
     finally:
         con.close()
 
-    print(f"Inserted {len(df_new)} forecast rows for {PROJECT}/{ITEM} (method={fm_name}).")
+    log(f"Inserted {len(df_new)} forecast rows for {PROJECT}/{ITEM} (method={fm_name}).", since=db_start)
+    log("Item forecast run complete.", since=run_start)
 
 
 if __name__ == '__main__':

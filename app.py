@@ -14,6 +14,14 @@ import time
 from urllib.parse import urlparse, urlunparse
 
 
+DEFAULT_NOSTRADAMUS_API_BASE_URL = os.getenv('NOSTRADAMUS_API_BASE_URL', 'https://api.nostradamus-api.com')
+
+
+def _run_suffix() -> str:
+    # Suffix used to make each run distinct in the DB/UI without schema changes.
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
+
+
 def _format_sim_input(df_history: pd.DataFrame) -> list:
     """Return sim_input_his list of dicts from a sales_history dataframe.
 
@@ -105,14 +113,19 @@ def _normalize_localhost_url(url: str) -> str:
     return url
 
 
-def _call_forecast_api(payload: dict, url: str = 'http://localhost:8000/api/v1/forecast/generate_async', timeout: int = 300) -> dict:
+def _call_forecast_api(
+    payload: dict,
+    url: str = 'https://api.nostradamus-api.com/api/v1/forecast/generate_async',
+    timeout: int = 300,
+    api_key: str | None = None,
+) -> dict:
     """Call the Nostradamus forecasting API and return parsed JSON.
 
     Default URL uses the async endpoint and a longer timeout to avoid origin timeouts.
     """
     headers = {'Content-Type': 'application/json'}
-    # include API key header if server has API_KEY env var set
-    api_key = os.getenv('API_KEY')
+    # include API key header if provided or API_KEY env var is set
+    api_key = api_key or os.getenv('NOSTRADAMUS_API_KEY') or os.getenv('API_KEY')
     if api_key:
         headers['X-API-Key'] = api_key
     url = _normalize_localhost_url(url)
@@ -121,7 +134,13 @@ def _call_forecast_api(payload: dict, url: str = 'http://localhost:8000/api/v1/f
     return resp.json()
 
 
-def _submit_job(payload: dict, base_url: str = 'http://localhost:8000', webhook_url: str | None = None, timeout: int = 30) -> dict:
+def _submit_job(
+    payload: dict,
+    base_url: str = 'https://api.nostradamus-api.com',
+    webhook_url: str | None = None,
+    timeout: int = 30,
+    api_key: str | None = None,
+) -> dict:
     """Submit a job to the async generate_job endpoint.
 
     Returns the JSON response which should include `job_id` and `status_url`.
@@ -135,7 +154,7 @@ def _submit_job(payload: dict, base_url: str = 'http://localhost:8000', webhook_
         params['webhook_url'] = webhook_url
 
     headers = {'Content-Type': 'application/json'}
-    api_key = os.getenv('API_KEY')
+    api_key = api_key or os.getenv('NOSTRADAMUS_API_KEY') or os.getenv('API_KEY')
     if api_key:
         headers['X-API-Key'] = api_key
 
@@ -144,13 +163,13 @@ def _submit_job(payload: dict, base_url: str = 'http://localhost:8000', webhook_
     return resp.json()
 
 
-def _poll_job_status(status_url: str, timeout: int = 600, poll_initial: float = 1.0) -> dict:
+def _poll_job_status(status_url: str, timeout: int = 600, poll_initial: float = 1.0, api_key: str | None = None) -> dict:
     """Poll the job status endpoint until finished or failed, return final job hash.
 
     Uses `X-API-Key` header if `API_KEY` env var set. Raises on timeout.
     """
     headers = {}
-    api_key = os.getenv('API_KEY')
+    api_key = api_key or os.getenv('NOSTRADAMUS_API_KEY') or os.getenv('API_KEY')
     if api_key:
         headers['X-API-Key'] = api_key
 
@@ -382,6 +401,33 @@ def main():
 
     st.sidebar.markdown("---")
 
+    # --- Global settings (used by both project + item forecast runs) ---
+    if 'nostradamus_api_base_url' not in st.session_state:
+        st.session_state['nostradamus_api_base_url'] = DEFAULT_NOSTRADAMUS_API_BASE_URL
+    if 'nostradamus_api_key' not in st.session_state:
+        st.session_state['nostradamus_api_key'] = ''
+    if 'timegpt_api_key' not in st.session_state:
+        st.session_state['timegpt_api_key'] = ''
+
+    with st.sidebar.expander('Settings', expanded=True):
+        st.text_input(
+            'Nostradamus API base URL',
+            key='nostradamus_api_base_url',
+            help='Base URL for forecast jobs, e.g. https://api.nostradamus-api.com',
+        )
+        st.text_input(
+            'Nostradamus API key (optional)',
+            type='password',
+            key='nostradamus_api_key',
+            help='Sent as X-API-Key header to the Nostradamus API (leave blank if not required).',
+        )
+        st.text_input(
+            'TimeGPT API key (optional)',
+            type='password',
+            key='timegpt_api_key',
+            help='Only used when Mode=timegpt; sent in the request payload.',
+        )
+
     projects = get_projects()
     if not projects:
         st.warning("No data found. Import CSVs first using `python ingest.py`.")
@@ -433,8 +479,6 @@ def main():
                 season_length = st.number_input("Season length", min_value=1, max_value=365, value=12)
                 forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
                 quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
-                api_key = st.text_input("TimeGPT API key (optional)", type="password")
-                api_base_url = st.text_input("Forecast API base URL", value="http://localhost:8000")
                 webhook_url = st.text_input("Webhook URL (optional)")
                 wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
                 poll_timeout_seconds = st.number_input(
@@ -463,8 +507,9 @@ def main():
                     'season_length': int(season_length),
                     'forecast_periods': int(forecast_periods),
                     'quantiles_text': quantiles_text,
-                    'api_key': api_key,
-                    'api_base_url': api_base_url,
+                    'api_key': st.session_state.get('timegpt_api_key', ''),
+                    'api_base_url': st.session_state.get('nostradamus_api_base_url', DEFAULT_NOSTRADAMUS_API_BASE_URL),
+                    'nostradamus_api_key': st.session_state.get('nostradamus_api_key', ''),
                     'webhook_url': webhook_url,
                     'wait_for_completion': bool(wait_for_completion),
                     'poll_timeout_seconds': int(poll_timeout_seconds),
@@ -502,8 +547,6 @@ def main():
                 season_length_item = st.number_input("Season length", min_value=1, max_value=365, value=12)
                 forecast_periods_item = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
                 quantiles_text_item = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
-                api_key_item = st.text_input("TimeGPT API key (optional)", type="password")
-                api_base_url_item = st.text_input("Forecast API base URL", value="http://localhost:8000")
                 timeout_seconds_item = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300)
                 submitted_item = st.form_submit_button("Single run")
 
@@ -519,8 +562,9 @@ def main():
                     'season_length': int(season_length_item),
                     'forecast_periods': int(forecast_periods_item),
                     'quantiles_text': quantiles_text_item,
-                    'api_key': api_key_item,
-                    'api_base_url': api_base_url_item,
+                    'api_key': st.session_state.get('timegpt_api_key', ''),
+                    'api_base_url': st.session_state.get('nostradamus_api_base_url', DEFAULT_NOSTRADAMUS_API_BASE_URL),
+                    'nostradamus_api_key': st.session_state.get('nostradamus_api_key', ''),
                     'timeout_seconds': int(timeout_seconds_item),
                 }
                 st.rerun()
@@ -530,6 +574,9 @@ def main():
     if project_req:
         st.markdown('---')
         st.subheader('Project forecast run')
+
+        project_run_tag = _run_suffix()
+        st.caption(f"Run tag: @{project_run_tag} (used to keep this run distinct)")
 
         api_base_url = _normalize_localhost_url(project_req['api_base_url'])
         if api_base_url != project_req['api_base_url']:
@@ -598,7 +645,12 @@ def main():
 
                     st.write(f"Batch {idx}/{len(item_batches)}: submitting job for {len(batch_items)} item(s)...")
                     try:
-                        resp = _submit_job(payload, base_url=api_base_url, webhook_url=project_req['webhook_url'])
+                        resp = _submit_job(
+                            payload,
+                            base_url=api_base_url,
+                            webhook_url=project_req['webhook_url'],
+                            api_key=(project_req.get('nostradamus_api_key') or None),
+                        )
                     except Exception as e:
                         st.error(f"Job submission failed (batch {idx}): {e}")
                         break
@@ -611,7 +663,11 @@ def main():
 
                     if project_req['wait_for_completion']:
                         try:
-                            job = _poll_job_status(status_url, timeout=int(project_req['poll_timeout_seconds']))
+                            job = _poll_job_status(
+                                status_url,
+                                timeout=int(project_req['poll_timeout_seconds']),
+                                api_key=(project_req.get('nostradamus_api_key') or None),
+                            )
                         except Exception as e:
                             st.error(f"Polling failed (batch {idx}): {e}")
                             break
@@ -630,10 +686,8 @@ def main():
                         else:
                             con = get_connection()
                             try:
-                                fm_name = df_new['forecast_method'].iloc[0]
-                                placeholders_items = ','.join(['?'] * len(batch_items))
-                                delete_sql = f"DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id IN ({placeholders_items})"
-                                con.execute(delete_sql, [project_req['project'], fm_name, *map(str, batch_items)])
+                                df_new = df_new.copy()
+                                df_new['forecast_method'] = df_new['forecast_method'].astype(str) + '@' + project_run_tag
                                 con.register('forecasts_api_df_batch', df_new)
                                 con.execute(
                                     'INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) '
@@ -643,7 +697,7 @@ def main():
                                 con.close()
 
                             any_inserted += len(df_new)
-                            st.success(f"Batch {idx}: inserted {len(df_new)} rows.")
+                            st.success(f"Batch {idx}: inserted {len(df_new)} rows (tagged @{project_run_tag}).")
                     else:
                         st.success(f"Batch {idx}: submitted job_id={job_id}. (Not waiting for completion)")
 
@@ -651,6 +705,8 @@ def main():
 
                 if any_inserted > 0:
                     st.success(f"Inserted {any_inserted} forecast rows total.")
+                    st.cache_data.clear()
+                    st.rerun()
 
     history, forecasts, combined = load_series(project, item_id, selected_methods)
     metrics_df = load_metrics(project, item_id, selected_methods)
@@ -697,22 +753,70 @@ def main():
                 if payload is not None:
                     if item_req['run_mode'] == 'timegpt' and item_req['api_key']:
                         payload['api_key'] = item_req['api_key']
-
                     api_base_url_item = _normalize_localhost_url(item_req['api_base_url'])
                     if api_base_url_item != item_req['api_base_url']:
                         st.warning(f"Using {api_base_url_item} (localhost usually doesn't use TLS).")
 
-                    url = f"{api_base_url_item.rstrip('/')}/api/v1/forecast/generate"
-                    st.info("Calling forecast API (synchronous) — should be quick for one item...")
+                    # Diagnostics to understand "one item" job size and duration.
+                    st.caption(f"Prepared sim_input_his with {len(sim_input_his)} rows.")
+                    if len(sim_input_his) > 5000:
+                        st.warning(
+                            "This item has a lot of history rows; even a single-item forecast can take a while. "
+                            "If you see timeouts, consider aggregating monthly or reducing history length on the API side."
+                        )
+
+                    # Use async job flow to avoid Cloudflare 524 timeouts on long model fits.
+                    nostradamus_key = item_req.get('nostradamus_api_key') or None
+                    run_start = time.perf_counter()
+                    st.info("Submitting forecast job and waiting for result...")
                     try:
-                        resp = _call_forecast_api(payload, url=url, timeout=int(item_req['timeout_seconds']))
+                        submit_start = time.perf_counter()
+                        resp = _submit_job(
+                            payload,
+                            base_url=api_base_url_item,
+                            webhook_url=None,
+                            timeout=min(30, int(item_req['timeout_seconds'])),
+                            api_key=nostradamus_key,
+                        )
+                        st.caption(
+                            f"Submitted job_id={resp.get('job_id')} in {time.perf_counter() - submit_start:.2f}s"
+                        )
                     except Exception as e:
-                        st.error(f"Forecast call failed: {e}")
+                        st.error(f"Forecast job submission failed: {e}")
                         resp = None
 
+                    status_url = (resp or {}).get('status_url')
+                    if resp is not None and not status_url:
+                        st.error(f"No status_url returned by API. job_id={(resp or {}).get('job_id')}")
+                        resp = None
+
+                    if resp is not None and status_url:
+                        try:
+                            poll_start = time.perf_counter()
+                            job = _poll_job_status(
+                                status_url,
+                                timeout=int(item_req['timeout_seconds']),
+                                api_key=nostradamus_key,
+                            )
+                            st.caption(
+                                f"Polling finished in {time.perf_counter() - poll_start:.2f}s "
+                                f"(total {time.perf_counter() - run_start:.2f}s)"
+                            )
+                        except Exception as e:
+                            st.error(f"Forecast polling failed: {e}")
+                            job = None
+
+                        if not job or job.get('status') != 'finished' or not job.get('result'):
+                            st.error(
+                                f"Job ended with status={(job or {}).get('status')} error={(job or {}).get('error')}"
+                            )
+                            resp = None
+                        else:
+                            resp = job.get('result')
+
                     if resp:
-                        st.write("Response:")
-                        st.json(resp)
+                        with st.expander("Response", expanded=False):
+                            st.json(resp)
                         df_new = _parse_nostradamus_response(
                             resp,
                             project=item_req['project'],
@@ -722,22 +826,22 @@ def main():
                         if df_new.empty:
                             st.warning("Could not parse any forecast rows from response.")
                         else:
-                            st.write("Preview of forecasts to import:")
-                            st.dataframe(df_new.head(200))
-                            if st.button("Import forecasts into DB"):
-                                con = get_connection()
-                                fm_name = df_new['forecast_method'].iloc[0]
-                                con.execute(
-                                    "DELETE FROM forecasts WHERE project = ? AND forecast_method = ? AND item_id = ?",
-                                    [item_req['project'], fm_name, item_req['item_id']],
-                                )
-                                con.register('forecasts_api_df_item', df_new)
-                                con.execute(
-                                    "INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) "
-                                    "SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item"
-                                )
-                                con.close()
-                                st.success(f"Imported {len(df_new)} forecast rows into forecasts table (method={fm_name}).")
+                            con = get_connection()
+                            run_tag = _run_suffix()
+                            df_new = df_new.copy()
+                            df_new['forecast_method'] = df_new['forecast_method'].astype(str) + '@' + run_tag
+                            con.register('forecasts_api_df_item', df_new)
+                            con.execute(
+                                "INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) "
+                                "SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item"
+                            )
+                            con.close()
+                            st.success(
+                                f"Saved {len(df_new)} forecast rows "
+                                f"(method(s) tagged with @{run_tag})."
+                            )
+                            st.cache_data.clear()
+                            st.rerun()
 
     # (item-level parameter form lives in the sidebar)
 
@@ -814,17 +918,14 @@ def main():
     )
     
     # Main chart
-    # Legend click toggles each series on/off, while keeping all legend entries.
+    # Legend click toggles each series on/off.
+    # Important: default view must show all series (empty='all').
     series_domain = sorted([s for s in combined_filtered['series'].dropna().unique().tolist()])
     series_sel = alt.selection_point(
         fields=["series"],
         bind="legend",
-        # Click toggles membership (no need for shift-click). Using string for compatibility.
         toggle="true",
-        # Start with everything visible. Clicking a legend item toggles it off/on.
-        value=[{"series": s} for s in series_domain],
-        # If everything is toggled off, show nothing (but legend remains).
-        empty="none",
+        empty="all",
     )
 
     chart = (

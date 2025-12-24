@@ -1,7 +1,9 @@
 import requests
 import json
+import os
 
-url = "https://api.nostradamus.com/api/v1/forecast/generate"
+base_url = os.getenv("NOSTRADAMUS_API_BASE_URL", "https://api.nostradamus-api.com")
+url = base_url.rstrip("/") + "/api/v1/forecast/generate"
 
 # Small sample payload (monthly example)
 payload = {
@@ -21,7 +23,11 @@ payload = {
 
 print('Sending request to', url)
 try:
-    resp = requests.post(url, json=payload, timeout=60)
+    headers = {}
+    api_key = os.getenv("NOSTRADAMUS_API_KEY")
+    if api_key:
+        headers["X-API-Key"] = api_key
+    resp = requests.post(url, json=payload, headers=headers, timeout=60)
     print('Status code:', resp.status_code)
     try:
         print(json.dumps(resp.json(), indent=2))
