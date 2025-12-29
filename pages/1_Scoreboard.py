@@ -6,8 +6,12 @@ from datetime import date
 from db import get_connection
 from metrics import recompute_all_metrics
 
+from nav import render_sidebar_nav
+
 
 st.set_page_config(page_title="Scoreboard", layout="wide")
+
+render_sidebar_nav()
 
 
 @st.cache_data
@@ -130,7 +134,25 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Scoreboard")
-        project = st.selectbox("Project", projects, index=0)
+        if 'active_project' in st.session_state and st.session_state['active_project'] in projects:
+            if 'score_project' not in st.session_state or st.session_state.get('score_project') != st.session_state.get('active_project'):
+                st.session_state['score_project'] = st.session_state['active_project']
+        elif 'score_project' in st.session_state and st.session_state['score_project'] in projects:
+            st.session_state['active_project'] = st.session_state['score_project']
+        else:
+            st.session_state['active_project'] = projects[0]
+            st.session_state['score_project'] = projects[0]
+
+        def _on_score_project_change() -> None:
+            st.session_state['active_project'] = st.session_state.get('score_project')
+
+        project = st.selectbox(
+            "Project",
+            projects,
+            index=0,
+            key='score_project',
+            on_change=_on_score_project_change,
+        )
 
     min_date, max_date = _get_project_date_bounds(project)
 
@@ -162,6 +184,7 @@ def main() -> None:
             min_value=0.0,
             value=1.0,
             step=1.0,
+            key='score_abs_actual_threshold',
             help="Points with abs(actual) < threshold are ignored; negative actuals are treated as 0.",
         )
     with c4:
@@ -197,15 +220,23 @@ def main() -> None:
     metric_names = sorted(df["metric_name"].dropna().unique().tolist())
     methods_all = sorted(df["forecast_method"].dropna().unique().tolist())
 
+    if 'score_metric' in st.session_state and st.session_state['score_metric'] not in metric_names:
+        st.session_state['score_metric'] = metric_names[0]
+    if 'score_methods' in st.session_state:
+        prev = st.session_state.get('score_methods')
+        if isinstance(prev, (list, tuple)):
+            st.session_state['score_methods'] = [m for m in prev if m in methods_all]
+
     with st.sidebar:
-        metric = st.selectbox("Metric", metric_names, index=0)
-        methods = st.multiselect("Forecast methods", methods_all, default=methods_all)
-        item_filter = st.text_input("Item filter (substring)", value="")
-        top_n = st.number_input("Max items", min_value=10, max_value=20000, value=500, step=10)
+        metric = st.selectbox("Metric", metric_names, index=0, key='score_metric')
+        methods = st.multiselect("Forecast methods", methods_all, default=methods_all, key='score_methods')
+        item_filter = st.text_input("Item filter (substring)", value="", key='score_item_filter')
+        top_n = st.number_input("Max items", min_value=10, max_value=20000, value=500, step=10, key='score_top_n')
         sort_mode = st.selectbox(
             "Sort rows by",
             options=["Best (min across selected methods)", "Worst (max across selected methods)", "Item id"],
             index=0,
+            key='score_sort_mode',
         )
 
     grid = _pivot_grid(df, metric_name=metric, methods=methods)

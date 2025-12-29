@@ -6,8 +6,12 @@ from db import init_db
 from ingest import import_sales_history, import_forecasts, import_sales_history_horizontal_months
 from db import get_connection
 
+from nav import render_sidebar_nav
+
 
 st.set_page_config(page_title="Data Import", layout="wide")
+
+render_sidebar_nav()
 
 
 def _repo_root() -> Path:
@@ -85,6 +89,7 @@ def main() -> None:
 
     project = st.text_input(
         "Project to import into",
+        key='import_project',
         help=(
             "Required. This will be written to sales_history.project for all imported rows. "
             "Existing projects: " + (", ".join(existing_projects) if existing_projects else "(none yet)")
@@ -94,6 +99,7 @@ def main() -> None:
     overwrite = st.checkbox(
         "Overwrite existing sales for this project in imported date range",
         value=True,
+        key='import_overwrite',
     )
 
     uploaded = st.file_uploader(

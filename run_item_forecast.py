@@ -244,6 +244,11 @@ def main():
     parser.add_argument('--api-url', default='https://api.nostradamus-api.com/api/v1/forecast/generate_async')
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--retries', type=int, default=3)
+    parser.add_argument(
+        '--local-model',
+        default='auto_arima',
+        help='Local model name to send to the API (e.g. auto_model, auto_arima, auto_ces, ...).',
+    )
     parser.add_argument('--season-length', type=int, default=12)
     parser.add_argument('--forecast-periods', type=int, default=12)
     parser.add_argument('--freq', default='M')
@@ -284,7 +289,7 @@ def main():
         'sim_input_his': sim_input_his,
         'forecast_periods': args.forecast_periods,
         'mode': 'local',
-        'local_model': 'auto_arima',
+        'local_model': args.local_model,
         'season_length': args.season_length,
         'freq': args.freq,
     }
@@ -323,7 +328,7 @@ def main():
         df_new = _parse_nostradamus_response(
             resp_json,
             project=PROJECT,
-            fm_override='auto_arima',
+            fm_override=args.local_model,
             as_of_date=as_of_eff,
             freq=args.freq,
         )

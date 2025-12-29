@@ -12,8 +12,52 @@ import os
 import time
 from urllib.parse import urlparse, urlunparse
 
+from nav import render_sidebar_nav
+
 
 DEFAULT_NOSTRADAMUS_API_BASE_URL = os.getenv('NOSTRADAMUS_API_BASE_URL', 'https://api.nostradamus-api.com')
+
+
+st.set_page_config(page_title='View per Item')
+
+render_sidebar_nav()
+
+
+def _ensure_single_choice_state(key: str, options: list, default=None) -> None:
+    if not options:
+        return
+    if key not in st.session_state:
+        st.session_state[key] = default if (default in options) else options[0]
+        return
+    if st.session_state[key] not in options:
+        st.session_state[key] = default if (default in options) else options[0]
+
+
+def _ensure_multi_choice_state(key: str, options: list, default: list | None = None) -> None:
+    if not options:
+        return
+    if key not in st.session_state:
+        st.session_state[key] = default if default is not None else list(options)
+        return
+    current = st.session_state.get(key)
+    if not isinstance(current, (list, tuple)):
+        current = []
+    filtered = [v for v in current if v in options]
+    st.session_state[key] = filtered
+    if not st.session_state[key]:
+        st.session_state[key] = default if default is not None else list(options)
+
+
+def _sync_project_widget(widget_key: str, projects: list[str]) -> None:
+    if not projects:
+        return
+    if 'active_project' not in st.session_state or st.session_state.get('active_project') not in projects:
+        st.session_state['active_project'] = projects[0]
+    # Keep the page-local widget in sync with the shared value.
+    if widget_key not in st.session_state or st.session_state.get(widget_key) not in projects:
+        st.session_state[widget_key] = st.session_state['active_project']
+    elif st.session_state.get(widget_key) != st.session_state.get('active_project'):
+        st.session_state[widget_key] = st.session_state['active_project']
 
 
 def _run_suffix() -> str:
@@ -551,21 +595,60 @@ def main():
         st.warning("No data found. Import CSVs first using `python ingest.py`.")
         return
 
-    project = st.sidebar.selectbox("Project", projects)
+    _sync_project_widget('app_project', projects)
+
+    def _on_app_project_change() -> None:
+        st.session_state['active_project'] = st.session_state.get('app_project')
+
+    project = st.sidebar.selectbox(
+        "Project",
+        projects,
+        key='app_project',
+        on_change=_on_app_project_change,
+    )
 
     items = get_items(project)
     if not items:
         st.warning("No items for this project.")
         return
 
-    item_id = st.sidebar.selectbox("Item", items)
+    _ensure_single_choice_state('main_item_id', items)
 
-    methods = get_forecast_methods(project, item_id)
-    selected_methods = st.sidebar.multiselect(
-        "Forecast methods",
-        options=methods,
-        default=methods  # select all by default
+    def _select_prev_item() -> None:
+        cur = st.session_state.get('main_item_id')
+        try:
+            idx = items.index(cur)
+        except Exception:
+            idx = 0
+        st.session_state['main_item_id'] = items[max(0, idx - 1)]
+
+    def _select_next_item() -> None:
+        cur = st.session_state.get('main_item_id')
+        try:
+            idx = items.index(cur)
+        except Exception:
+            idx = 0
+        st.session_state['main_item_id'] = items[min(len(items) - 1, idx + 1)]
+
+    item_id = st.sidebar.selectbox("Item", items, key='main_item_id')
+
+    try:
+        _cur_idx = items.index(st.session_state.get('main_item_id'))
+    except Exception:
+        _cur_idx = 0
+
+    c_prev, c_next = st.sidebar.columns(2)
+    c_prev.button("Prev item", on_click=_select_prev_item, disabled=_cur_idx <= 0, use_container_width=True)
+    c_next.button(
+        "Next item",
+        on_click=_select_next_item,
+        disabled=_cur_idx >= (len(items) - 1),
+        use_container_width=True,
     )
+
+    # Viewing: always show all methods; legend click toggles visibility.
+    methods = get_forecast_methods(project, item_id)
+    selected_methods = methods
 
     st.sidebar.markdown("---")
 
@@ -580,45 +663,66 @@ def main():
         with st.sidebar.container():
             st.markdown("**Project forecast parameters**")
             with st.form("forecast_form"):
-                run_mode = st.selectbox("Mode", options=["local", "timegpt"], index=0)
+                if 'proj_run_mode' not in st.session_state:
+                    st.session_state['proj_run_mode'] = 'local'
+                run_mode = st.selectbox("Mode", options=["local", "timegpt"], index=0, key='proj_run_mode')
                 local_model = st.selectbox(
                     "Local model",
                     options=[
-                        'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
+                        'auto_model','auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
                     ],
                     index=0,
+                    key='proj_local_model',
                 )
-                freq = st.selectbox("Frequency", options=['D','M','W','H','Q','Y'], index=1)
+                if 'proj_freq' not in st.session_state:
+                    st.session_state['proj_freq'] = 'M'
+                freq = st.selectbox("Frequency", options=['D','M','W','H','Q','Y'], index=1, key='proj_freq')
                 aggregate_monthly = st.checkbox(
                     "Aggregate to monthly totals",
-                    value=False,
+                    value=True,
+                    key='proj_aggregate_monthly',
                     help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as M.",
                 )
-                season_length = st.number_input("Season length", min_value=1, max_value=365, value=12)
-                forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
-                quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
-                webhook_url = st.text_input("Webhook URL (optional)")
-                wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True)
+                season_length = st.number_input("Season length", min_value=1, max_value=365, value=12, key='proj_season_length')
+                forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12, key='proj_forecast_periods')
+                quantiles_text = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="", key='proj_quantiles_text')
+                webhook_url = st.text_input("Webhook URL (optional)", key='proj_webhook_url')
+                wait_for_completion = st.checkbox("Wait for completion (poll status)", value=True, key='proj_wait_for_completion')
                 poll_timeout_seconds = st.number_input(
                     "Polling timeout (s)",
                     min_value=60,
                     max_value=24 * 60 * 60,
                     value=1800,
+                    key='proj_poll_timeout_seconds',
                 )
-                run_in_batches = st.checkbox("Run in batches", value=True)
-                batch_size_items = st.number_input("Batch size (items per job)", min_value=1, max_value=5000, value=500)
+                run_in_batches = st.checkbox("Run in batches", value=True, key='proj_run_in_batches')
+                batch_size_items = st.number_input("Batch size (items per job)", min_value=1, max_value=5000, value=500, key='proj_batch_size_items')
                 min_d, max_d = get_history_date_range(project)
+                if min_d and max_d:
+                    prev = st.session_state.get('proj_as_of_date')
+                    if prev is not None:
+                        try:
+                            prev_d = pd.to_datetime(prev).date() if not isinstance(prev, date) else prev
+                            if prev_d < min_d:
+                                st.session_state['proj_as_of_date'] = min_d
+                            elif prev_d > max_d:
+                                st.session_state['proj_as_of_date'] = max_d
+                        except Exception:
+                            st.session_state['proj_as_of_date'] = max_d
                 as_of_date_project = st.date_input(
                     "Forecast as-of date",
                     value=max_d if max_d else datetime.now().date(),
                     min_value=min_d,
                     max_value=max_d,
+                    key='proj_as_of_date',
                     help="Only history up to this date is used; forecast starts the day after (freq-aligned).",
                 )
+                _ensure_multi_choice_state('proj_item_selection', items, default=[])
                 item_selection = st.multiselect(
                     "Items to include (leave empty = all items in project)",
                     options=items,
                     default=[],
+                    key='proj_item_selection',
                 )
                 submitted = st.form_submit_button("Batch run")
 
@@ -657,32 +761,50 @@ def main():
         with st.sidebar.container():
             st.markdown("**Item forecast parameters**")
             with st.form("forecast_item_form"):
-                run_mode_item = st.selectbox("Mode", options=["local", "timegpt"], index=0)
+                if 'item_run_mode' not in st.session_state:
+                    st.session_state['item_run_mode'] = 'local'
+                run_mode_item = st.selectbox("Mode", options=["local", "timegpt"], index=0, key='item_run_mode')
                 local_model_item = st.selectbox(
                     "Local model",
                     options=[
-                        'auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
+                        'auto_model','auto_arima','auto_ets','naive','seasonal_naive','croston_optimized','adida','theta','optimized_theta','auto_ces'
                     ],
                     index=0,
+                    key='item_local_model',
                 )
-                freq_item = st.selectbox("Frequency", options=['D','M','W','H','Q','Y'], index=1)
+                if 'item_freq' not in st.session_state:
+                    st.session_state['item_freq'] = 'M'
+                freq_item = st.selectbox("Frequency", options=['D','M','W','H','Q','Y'], index=1, key='item_freq')
                 aggregate_monthly_item = st.checkbox(
                     "Aggregate to monthly totals",
-                    value=False,
+                    value=True,
+                    key='item_aggregate_monthly',
                     help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as M.",
                 )
-                season_length_item = st.number_input("Season length", min_value=1, max_value=365, value=12)
-                forecast_periods_item = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
+                season_length_item = st.number_input("Season length", min_value=1, max_value=365, value=12, key='item_season_length')
+                forecast_periods_item = st.number_input("Forecast periods", min_value=1, max_value=365, value=12, key='item_forecast_periods')
                 min_di, max_di = get_history_date_range(project, item_id=item_id)
+                if min_di and max_di:
+                    prev = st.session_state.get('item_as_of_date')
+                    if prev is not None:
+                        try:
+                            prev_d = pd.to_datetime(prev).date() if not isinstance(prev, date) else prev
+                            if prev_d < min_di:
+                                st.session_state['item_as_of_date'] = min_di
+                            elif prev_d > max_di:
+                                st.session_state['item_as_of_date'] = max_di
+                        except Exception:
+                            st.session_state['item_as_of_date'] = max_di
                 as_of_date_item = st.date_input(
                     "Forecast as-of date",
                     value=max_di if max_di else datetime.now().date(),
                     min_value=min_di,
                     max_value=max_di,
+                    key='item_as_of_date',
                     help="Only history up to this date is used; forecast starts the day after (freq-aligned).",
                 )
-                quantiles_text_item = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
-                timeout_seconds_item = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300)
+                quantiles_text_item = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="", key='item_quantiles_text')
+                timeout_seconds_item = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300, key='item_timeout_seconds')
                 submitted_item = st.form_submit_button("Single run")
 
             if submitted_item:
@@ -1066,6 +1188,7 @@ def main():
     show_monthly_history = st.checkbox(
         "Show monthly aggregated history",
         value=True,
+        key='main_show_monthly_history',
         help="Overlays a monthly-summed history series dated to the 1st of each month.",
     )
 
