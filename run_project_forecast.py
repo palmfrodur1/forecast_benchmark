@@ -8,7 +8,7 @@ PROJECT = 'bmv_v1'
 FORECAST_PERIODS = 12
 LOCAL_MODEL = 'auto_arima'
 SEASON_LENGTH = 12
-FREQ = 'MS'
+FREQ = 'M'
 
 run_start = start_timer()
 log(f"Preparing forecast run for project={PROJECT} (model={LOCAL_MODEL}, periods={FORECAST_PERIODS})")

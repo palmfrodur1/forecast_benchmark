@@ -3,10 +3,9 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from db import get_connection, init_db
 from ingest import import_sales_history, import_forecasts
-from metrics import recompute_all_metrics      
 import requests
 import json
 import os
@@ -112,7 +111,6 @@ def _normalize_localhost_url(url: str) -> str:
         return url
     return url
 
-
 def _call_forecast_api(
     payload: dict,
     url: str = 'https://api.nostradamus-api.com/api/v1/forecast/generate_async',
@@ -190,7 +188,14 @@ def _poll_job_status(status_url: str, timeout: int = 600, poll_initial: float = 
     raise TimeoutError(f"Polling job status timed out after {timeout} seconds")
 
 
-def _parse_nostradamus_response(resp: dict, project: str, fm_override: str | None = None) -> pd.DataFrame:
+def _parse_nostradamus_response(
+    resp: dict,
+    project: str,
+    fm_override: str | None = None,
+    *,
+    as_of_date: date | None = None,
+    freq: str | None = None,
+) -> pd.DataFrame:
     """Parse Nostradamus API response into a DataFrame suitable for inserting into `forecasts`.
 
     Handles response shapes like the example you provided:
@@ -218,22 +223,57 @@ def _parse_nostradamus_response(resp: dict, project: str, fm_override: str | Non
         vals = it.get('forecast') or it.get('forecasts') or it.get('values')
         dates = it.get('forecast_dates') or it.get('dates') or it.get('forecast_date')
 
-        # Case: parallel lists of values and dates
-        if isinstance(vals, list) and isinstance(dates, list) and len(vals) == len(dates):
-            for d, v in zip(dates, vals):
-                try:
-                    rows.append({
-                        'project': project,
-                        'forecast_method': fm,
-                        'item_id': str(item_id),
-                        'forecast_date': pd.to_datetime(d).date(),
-                        'forecast': float(v)
-                    })
-                except Exception:
-                    continue
+        use_generated_dates = as_of_date is not None and bool(freq)
+
+        # Case: lists of values (optionally with dates)
+        if isinstance(vals, list):
+            if use_generated_dates:
+                gen_dates = _generate_forecast_dates(as_of_date, len(vals), str(freq))
+                for d, v in zip(gen_dates, vals):
+                    try:
+                        rows.append({
+                            'project': project,
+                            'forecast_method': fm,
+                            'item_id': str(item_id),
+                            'forecast_date': d,
+                            'forecast': float(v)
+                        })
+                    except Exception:
+                        continue
+                continue
+            if isinstance(dates, list) and len(vals) == len(dates):
+                for d, v in zip(dates, vals):
+                    try:
+                        rows.append({
+                            'project': project,
+                            'forecast_method': fm,
+                            'item_id': str(item_id),
+                            'forecast_date': pd.to_datetime(d).date(),
+                            'forecast': float(v)
+                        })
+                    except Exception:
+                        continue
+                continue
 
         # Case: list of dict points
         elif isinstance(vals, list) and all(isinstance(p, dict) for p in vals):
+            if use_generated_dates:
+                gen_dates = _generate_forecast_dates(as_of_date, len(vals), str(freq))
+                for d, p in zip(gen_dates, vals):
+                    v = p.get('value') or p.get('yhat') or p.get('forecast') or p.get('y')
+                    if v is None:
+                        continue
+                    try:
+                        rows.append({
+                            'project': project,
+                            'forecast_method': fm,
+                            'item_id': str(item_id),
+                            'forecast_date': d,
+                            'forecast': float(v)
+                        })
+                    except Exception:
+                        continue
+                continue
             for p in vals:
                 d = p.get('day') or p.get('date') or p.get('ds')
                 v = p.get('value') or p.get('yhat') or p.get('forecast') or p.get('y')
@@ -299,7 +339,7 @@ def get_items(project: str):
 def get_forecast_methods(project: str, item_id: str):
     con = get_connection()
     df = con.execute("""
-        SELECT DISTINCT forecast_method
+                SELECT DISTINCT split_part(forecast_method, '@', 1) AS forecast_method
         FROM forecasts
         WHERE project = ? AND item_id = ?
         ORDER BY forecast_method
@@ -322,21 +362,34 @@ def load_series(project: str, item_id: str, methods: list[str]):
     """, [project, item_id]).fetchdf()
 
     if methods:
-        methods_tuple = tuple(methods)
         placeholders = ",".join(["?"] * len(methods))
         sql = f"""
+            WITH chosen AS (
+                SELECT
+                    split_part(forecast_method, '@', 1) AS base_method,
+                    COALESCE(
+                        MAX(CASE WHEN strpos(forecast_method, '@') = 0 THEN forecast_method END),
+                        MAX(forecast_method)
+                    ) AS chosen_method
+                FROM forecasts
+                WHERE project = ?
+                  AND item_id = ?
+                  AND split_part(forecast_method, '@', 1) IN ({placeholders})
+                GROUP BY 1
+            )
             SELECT
-                forecast_date AS date,
-                forecast      AS value,
-                forecast_method AS series
-            FROM forecasts
-            WHERE project = ?
-              AND item_id = ?
-              AND forecast_method IN ({placeholders})
-            ORDER BY forecast_date
+                f.forecast_date AS date,
+                f.forecast      AS value,
+                c.base_method   AS series
+            FROM forecasts f
+            JOIN chosen c
+              ON f.forecast_method = c.chosen_method
+            WHERE f.project = ?
+              AND f.item_id = ?
+            ORDER BY f.forecast_date
         """
 
-        params = [project, item_id, *methods]
+        params = [project, item_id, *methods, project, item_id]
         forecasts = con.execute(sql, params).fetchdf()
     else:
         forecasts = pd.DataFrame(columns=["date", "value", "series"])
@@ -354,50 +407,115 @@ def load_metrics(project: str, item_id: str, methods: list[str]):
     con = get_connection()
     placeholders = ",".join(["?"] * len(methods))
     sql = f"""
-        SELECT forecast_method, metric_name, metric_value, n_points
-        FROM forecast_metrics
-        WHERE project = ?
-          AND item_id = ?
-          AND forecast_method IN ({placeholders})
-        ORDER BY forecast_method, metric_name
+        WITH chosen AS (
+            SELECT
+                split_part(forecast_method, '@', 1) AS base_method,
+                COALESCE(
+                    MAX(CASE WHEN strpos(forecast_method, '@') = 0 THEN forecast_method END),
+                    MAX(forecast_method)
+                ) AS chosen_method
+            FROM forecast_metrics
+            WHERE project = ?
+              AND item_id = ?
+              AND split_part(forecast_method, '@', 1) IN ({placeholders})
+            GROUP BY 1
+        )
+        SELECT
+            c.base_method AS forecast_method,
+            m.metric_name,
+            m.metric_value,
+            m.n_points
+        FROM forecast_metrics m
+        JOIN chosen c
+          ON m.forecast_method = c.chosen_method
+        WHERE m.project = ?
+          AND m.item_id = ?
+        ORDER BY c.base_method, m.metric_name
     """
-    params = [project, item_id, *methods]
+    params = [project, item_id, *methods, project, item_id]
     df = con.execute(sql, params).fetchdf()
     con.close()
     return df
 
 
+@st.cache_data
+def get_history_date_range(project: str, item_id: str | None = None):
+    con = get_connection()
+    if item_id is None:
+        df = con.execute(
+            "SELECT MIN(sale_date) AS min_date, MAX(sale_date) AS max_date FROM sales_history WHERE project = ?",
+            [project],
+        ).fetchdf()
+    else:
+        df = con.execute(
+            "SELECT MIN(sale_date) AS min_date, MAX(sale_date) AS max_date FROM sales_history WHERE project = ? AND item_id = ?",
+            [project, item_id],
+        ).fetchdf()
+    con.close()
+    if df.empty or df.iloc[0].isna().any():
+        return None, None
+    return pd.to_datetime(df.iloc[0]['min_date']).date(), pd.to_datetime(df.iloc[0]['max_date']).date()
+
+
+def _apply_as_of_cutoff(df_hist: pd.DataFrame, as_of_date):
+    if df_hist is None or df_hist.empty:
+        return df_hist, None
+    if as_of_date is None:
+        return df_hist, None
+    df = df_hist.copy()
+    df['sale_date'] = pd.to_datetime(df['sale_date'], errors='coerce')
+    df = df[df['sale_date'].notna()].copy()
+    if df.empty:
+        return df, None
+    df = df[df['sale_date'].dt.date <= as_of_date].copy()
+    df['sale_date'] = df['sale_date'].dt.date
+    return df, as_of_date
+
+
+def _effective_as_of_for_monthly(as_of_date):
+    """For monthly aggregation, avoid including partial months.
+
+    If as_of_date isn't the last day of its month, use the previous month-end.
+    """
+    if as_of_date is None:
+        return None
+    ts = pd.Timestamp(as_of_date)
+    month_end = (ts + pd.offsets.MonthEnd(0)).date()
+    if as_of_date == month_end:
+        return as_of_date
+    return (ts - pd.offsets.MonthEnd(1)).date()
+
+
+def _forecast_start_after_as_of(as_of: date, freq: str) -> pd.Timestamp:
+    """First forecast timestamp strictly after as_of, aligned to freq.
+
+    Semantics:
+    - Daily: next day
+    - Monthly: next month start
+    """
+    ts = pd.Timestamp(as_of)
+    f = str(freq or '').upper()
+    if f.startswith('M'):
+        return (ts + pd.offsets.MonthBegin(1)).normalize()
+    return (ts + pd.Timedelta(days=1)).normalize()
+
+
+def _generate_forecast_dates(as_of: date, periods: int, freq: str) -> list[date]:
+    """Generate forecast dates from as_of + freq.
+
+    Note: even if payload freq is 'M', we store/plot month-start dates.
+    """
+    start = _forecast_start_after_as_of(as_of, freq)
+    f = str(freq or '').upper()
+    if f.startswith('M'):
+        rng = pd.date_range(start=start, periods=int(periods), freq='MS')
+    else:
+        rng = pd.date_range(start=start, periods=int(periods), freq=freq or 'D')
+    return [pd.Timestamp(d).date() for d in rng]
+
+
 def main():
     st.title("Forecast Benchmark Explorer")
-
-    # Reload data button
-    if st.sidebar.button("🔄 Reload Data from CSV"):
-        DATA_DIR = Path(__file__).parent / "Data"
-        sales_csv = DATA_DIR / "sales_history.csv"
-        forecasts_csv = DATA_DIR / "forecasts.csv"
-        
-        with st.spinner("Reloading data..."):
-            try:
-                import_sales_history(sales_csv)
-                import_forecasts(forecasts_csv)
-                st.cache_data.clear()
-                st.success("Data reloaded successfully!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error reloading data: {e}")
-                return
-
-    if st.sidebar.button("Recompute metrics (all items)"):
-        with st.spinner("Recomputing metrics..."):
-            try:
-                recompute_all_metrics()
-                st.cache_data.clear()  # clear cached queries
-                st.success("Metrics recomputed.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error recomputing metrics: {e}")
-                return
-      
 
     st.sidebar.markdown("---")
 
@@ -470,11 +588,11 @@ def main():
                     ],
                     index=0,
                 )
-                freq = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
+                freq = st.selectbox("Frequency", options=['D','M','W','H','Q','Y'], index=1)
                 aggregate_monthly = st.checkbox(
                     "Aggregate to monthly totals",
                     value=False,
-                    help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as MS.",
+                    help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as M.",
                 )
                 season_length = st.number_input("Season length", min_value=1, max_value=365, value=12)
                 forecast_periods = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
@@ -489,6 +607,14 @@ def main():
                 )
                 run_in_batches = st.checkbox("Run in batches", value=True)
                 batch_size_items = st.number_input("Batch size (items per job)", min_value=1, max_value=5000, value=500)
+                min_d, max_d = get_history_date_range(project)
+                as_of_date_project = st.date_input(
+                    "Forecast as-of date",
+                    value=max_d if max_d else datetime.now().date(),
+                    min_value=min_d,
+                    max_value=max_d,
+                    help="Only history up to this date is used; forecast starts the day after (freq-aligned).",
+                )
                 item_selection = st.multiselect(
                     "Items to include (leave empty = all items in project)",
                     options=items,
@@ -515,6 +641,7 @@ def main():
                     'poll_timeout_seconds': int(poll_timeout_seconds),
                     'run_in_batches': bool(run_in_batches),
                     'batch_size_items': int(batch_size_items),
+                    'as_of_date': as_of_date_project.isoformat() if as_of_date_project else None,
                     'item_selection': item_selection,
                 }
                 st.rerun()
@@ -538,14 +665,22 @@ def main():
                     ],
                     index=0,
                 )
-                freq_item = st.selectbox("Frequency", options=['D','MS','W','H','Q','Y'], index=1)
+                freq_item = st.selectbox("Frequency", options=['D','M','W','H','Q','Y'], index=1)
                 aggregate_monthly_item = st.checkbox(
                     "Aggregate to monthly totals",
                     value=False,
-                    help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as MS.",
+                    help="If enabled, daily sales are summed per month and sent with dates set to the 1st of the month. Frequency will be sent as M.",
                 )
                 season_length_item = st.number_input("Season length", min_value=1, max_value=365, value=12)
                 forecast_periods_item = st.number_input("Forecast periods", min_value=1, max_value=365, value=12)
+                min_di, max_di = get_history_date_range(project, item_id=item_id)
+                as_of_date_item = st.date_input(
+                    "Forecast as-of date",
+                    value=max_di if max_di else datetime.now().date(),
+                    min_value=min_di,
+                    max_value=max_di,
+                    help="Only history up to this date is used; forecast starts the day after (freq-aligned).",
+                )
                 quantiles_text_item = st.text_input("Quantiles (comma-separated, for TimeGPT)", value="")
                 timeout_seconds_item = st.number_input("Request timeout (s)", min_value=30, max_value=1200, value=300)
                 submitted_item = st.form_submit_button("Single run")
@@ -561,6 +696,7 @@ def main():
                     'aggregate_monthly': bool(aggregate_monthly_item),
                     'season_length': int(season_length_item),
                     'forecast_periods': int(forecast_periods_item),
+                    'as_of_date': as_of_date_item.isoformat() if as_of_date_item else None,
                     'quantiles_text': quantiles_text_item,
                     'api_key': st.session_state.get('timegpt_api_key', ''),
                     'api_base_url': st.session_state.get('nostradamus_api_base_url', DEFAULT_NOSTRADAMUS_API_BASE_URL),
@@ -576,6 +712,8 @@ def main():
         st.subheader('Project forecast run')
 
         project_run_tag = _run_suffix()
+        if project_req.get('as_of_date'):
+            project_run_tag = f"{project_run_tag}_asof{project_req['as_of_date']}"
         st.caption(f"Run tag: @{project_run_tag} (used to keep this run distinct)")
 
         api_base_url = _normalize_localhost_url(project_req['api_base_url'])
@@ -597,6 +735,19 @@ def main():
         if df_hist.empty:
             st.error("No sales history found for the selected project/items.")
         else:
+            as_of_date = None
+            if project_req.get('as_of_date'):
+                try:
+                    as_of_date = pd.to_datetime(project_req['as_of_date']).date()
+                except Exception:
+                    as_of_date = None
+
+            if as_of_date is not None:
+                df_hist, _ = _apply_as_of_cutoff(df_hist, as_of_date)
+                if df_hist.empty:
+                    st.error("No history rows left after applying as-of date.")
+                    return
+
             if project_req['aggregate_monthly']:
                 df_hist = _aggregate_monthly_sales(df_hist)
 
@@ -630,7 +781,7 @@ def main():
                         'mode': project_req['run_mode'],
                         'local_model': project_req['local_model'],
                         'season_length': int(project_req['season_length']),
-                        'freq': 'MS' if project_req['aggregate_monthly'] else project_req['freq'],
+                        'freq': 'M' if project_req['aggregate_monthly'] else project_req['freq'],
                     }
                     if project_req['quantiles_text'].strip():
                         try:
@@ -680,6 +831,8 @@ def main():
                             job.get('result'),
                             project=project_req['project'],
                             fm_override=project_req['local_model'] if project_req['run_mode'] == 'local' else None,
+                            as_of_date=as_of_date,
+                            freq=payload.get('freq'),
                         )
                         if df_new.empty:
                             st.warning(f"Batch {idx}: parsed 0 forecast rows.")
@@ -687,8 +840,19 @@ def main():
                             con = get_connection()
                             try:
                                 df_new = df_new.copy()
-                                df_new['forecast_method'] = df_new['forecast_method'].astype(str) + '@' + project_run_tag
                                 con.register('forecasts_api_df_batch', df_new)
+                                # Overwrite existing forecasts for these (item, method) pairs.
+                                # Delete both untagged + any previously tagged runs for the same base method.
+                                con.execute(
+                                    """
+                                    DELETE FROM forecasts
+                                    WHERE project = ?
+                                      AND (item_id, split_part(forecast_method, '@', 1)) IN (
+                                          SELECT DISTINCT item_id, forecast_method FROM forecasts_api_df_batch
+                                      )
+                                    """,
+                                    [project_req['project']],
+                                )
                                 con.execute(
                                     'INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) '
                                     'SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_batch'
@@ -697,7 +861,7 @@ def main():
                                 con.close()
 
                             any_inserted += len(df_new)
-                            st.success(f"Batch {idx}: inserted {len(df_new)} rows (tagged @{project_run_tag}).")
+                            st.success(f"Batch {idx}: inserted {len(df_new)} rows (overwrote existing for same method).")
                     else:
                         st.success(f"Batch {idx}: submitted job_id={job_id}. (Not waiting for completion)")
 
@@ -727,6 +891,19 @@ def main():
         if df_hist_item.empty:
             st.error("No sales history found for this item.")
         else:
+            as_of_date_item = None
+            if item_req.get('as_of_date'):
+                try:
+                    as_of_date_item = pd.to_datetime(item_req['as_of_date']).date()
+                except Exception:
+                    as_of_date_item = None
+
+            if as_of_date_item is not None:
+                df_hist_item, _ = _apply_as_of_cutoff(df_hist_item, as_of_date_item)
+                if df_hist_item.empty:
+                    st.error("No history rows left after applying as-of date.")
+                    return
+
             if item_req['aggregate_monthly']:
                 df_hist_item = _aggregate_monthly_sales(df_hist_item)
 
@@ -740,7 +917,7 @@ def main():
                     'mode': item_req['run_mode'],
                     'local_model': item_req['local_model'],
                     'season_length': int(item_req['season_length']),
-                    'freq': 'MS' if item_req['aggregate_monthly'] else item_req['freq'],
+                    'freq': 'M' if item_req['aggregate_monthly'] else item_req['freq'],
                 }
                 if item_req['quantiles_text'].strip():
                     try:
@@ -821,24 +998,34 @@ def main():
                             resp,
                             project=item_req['project'],
                             fm_override=item_req['local_model'] if item_req['run_mode'] == 'local' else None,
+                            as_of_date=as_of_date_item,
+                            freq=payload.get('freq'),
                         )
 
                         if df_new.empty:
                             st.warning("Could not parse any forecast rows from response.")
                         else:
                             con = get_connection()
-                            run_tag = _run_suffix()
                             df_new = df_new.copy()
-                            df_new['forecast_method'] = df_new['forecast_method'].astype(str) + '@' + run_tag
                             con.register('forecasts_api_df_item', df_new)
+                            con.execute(
+                                """
+                                DELETE FROM forecasts
+                                WHERE project = ?
+                                  AND item_id = ?
+                                  AND split_part(forecast_method, '@', 1) IN (
+                                      SELECT DISTINCT forecast_method FROM forecasts_api_df_item
+                                  )
+                                """,
+                                [item_req['project'], item_req['item_id']],
+                            )
                             con.execute(
                                 "INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) "
                                 "SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item"
                             )
                             con.close()
                             st.success(
-                                f"Saved {len(df_new)} forecast rows "
-                                f"(method(s) tagged with @{run_tag})."
+                                f"Saved {len(df_new)} forecast rows (overwrote existing for same method)."
                             )
                             st.cache_data.clear()
                             st.rerun()
@@ -889,14 +1076,33 @@ def main():
             combined_for_chart = pd.concat([combined_for_chart, monthly_hist], ignore_index=True)
 
     # Filter data by date range
-    combined_for_chart['date'] = pd.to_datetime(combined_for_chart['date'])
-    combined_filtered = combined_for_chart[(combined_for_chart['date'].dt.date >= start_date) & (combined_for_chart['date'].dt.date <= end_date)]
-    
+    combined_for_chart['date'] = pd.to_datetime(combined_for_chart['date'], errors='coerce')
+    combined_for_chart = combined_for_chart[combined_for_chart['date'].notna()].copy()
+
+    if combined_for_chart.empty:
+        st.info("No data for this item yet.")
+        return
+
+    data_min = combined_for_chart['date'].min().date()
+    data_max = combined_for_chart['date'].max().date()
+
+    combined_filtered = combined_for_chart[
+        (combined_for_chart['date'].dt.date >= start_date) & (combined_for_chart['date'].dt.date <= end_date)
+    ]
+
+    if combined_filtered.empty:
+        # If the user-selected window filters out everything, fall back to the real data range
+        start_date = data_min
+        end_date = data_max
+        combined_filtered = combined_for_chart[
+            (combined_for_chart['date'].dt.date >= start_date) & (combined_for_chart['date'].dt.date <= end_date)
+        ]
+
     history_filtered = history[(pd.to_datetime(history['date']).dt.date >= start_date) & (pd.to_datetime(history['date']).dt.date <= end_date)]
     forecasts_filtered = forecasts[(pd.to_datetime(forecasts['date']).dt.date >= start_date) & (pd.to_datetime(forecasts['date']).dt.date <= end_date)]
 
     if combined_filtered.empty:
-        st.info("No data for this selection yet.")
+        st.info("No data to plot.")
         return
 
     # Create background shading for past vs future
@@ -918,14 +1124,17 @@ def main():
     )
     
     # Main chart
-    # Legend click toggles each series on/off.
-    # Important: default view must show all series (empty='all').
+    # Legend click toggles each series on/off, while keeping all legend entries.
     series_domain = sorted([s for s in combined_filtered['series'].dropna().unique().tolist()])
     series_sel = alt.selection_point(
         fields=["series"],
         bind="legend",
+        # Click toggles membership (no need for shift-click). Using string for compatibility.
         toggle="true",
-        empty="all",
+        # Start with everything visible. Clicking a legend item toggles it off/on.
+        value=[{"series": s} for s in series_domain],
+        # If everything is toggled off, show nothing (but legend remains).
+        empty="none",
     )
 
     chart = (
@@ -958,6 +1167,9 @@ def main():
             values="metric_value"
         )
         pivot = pivot.sort_index()
+        # Ensure the table includes all selected methods, even if some have no metrics yet.
+        if selected_methods:
+            pivot = pivot.reindex(selected_methods)
         st.dataframe(pivot.style.format("{:.2f}"))
         with st.expander("Raw metric rows"):
             st.dataframe(metrics_df)

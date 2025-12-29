@@ -2,9 +2,11 @@ import argparse
 import json
 import time
 import os
+from datetime import date
 from math import ceil
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
+import pandas as pd
 from db import get_connection
 from app import _format_sim_input, _parse_nostradamus_response, _aggregate_monthly_sales
 from client_nostradamus import submit_forecast_job, wait_for_job
@@ -24,9 +26,59 @@ def save_progress(path: Path, completed_batches):
     path.write_text(json.dumps(sorted(list(completed_batches)), indent=2))
 
 
+def _parse_as_of_date(value: str | None) -> date | None:
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v:
+        return None
+    return pd.to_datetime(v, errors='raise').date()
+
+
+def _apply_as_of_cutoff(df_hist, as_of: date | None):
+    if df_hist is None or df_hist.empty:
+        return df_hist, as_of
+    df = df_hist.copy()
+    df['sale_date'] = pd.to_datetime(df['sale_date'], errors='coerce')
+    df = df[df['sale_date'].notna()].copy()
+    if df.empty:
+        return df, as_of
+
+    min_d = df['sale_date'].min().date()
+    max_d = df['sale_date'].max().date()
+
+    if as_of is None:
+        as_of_eff = max_d
+    else:
+        as_of_eff = as_of
+        if as_of_eff > max_d:
+            as_of_eff = max_d
+        if as_of_eff < min_d:
+            raise ValueError(f"as_of_date={as_of_eff.isoformat()} is before first history date {min_d.isoformat()}")
+
+    df = df[df['sale_date'].dt.date <= as_of_eff].copy()
+    df['sale_date'] = df['sale_date'].dt.date
+    return df, as_of_eff
+
+
+def _effective_as_of_for_monthly(as_of: date | None) -> date | None:
+    if as_of is None:
+        return None
+    ts = pd.Timestamp(as_of)
+    month_end = (ts + pd.offsets.MonthEnd(0)).date()
+    if as_of == month_end:
+        return as_of
+    return (ts - pd.offsets.MonthEnd(1)).date()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run project forecasts in batches (resumable).')
     parser.add_argument('--project', default='BMV_v1')
+    parser.add_argument(
+        '--as-of-date',
+        default=None,
+        help='Cutoff date (YYYY-MM-DD). Only history up to this date is sent; forecast starts the day after (freq-aligned).',
+    )
     parser.add_argument('--batch-size', type=int, default=100)
     parser.add_argument('--forecast-periods', type=int, default=12)
     parser.add_argument('--local-model', default='auto_arima')
@@ -35,7 +87,7 @@ def main():
     parser.add_argument(
         '--aggregate-monthly',
         action='store_true',
-        help='If set, sums daily sales per month and sets sale_date to month start (YYYY-MM-01); forces freq=MS in payload.',
+        help='If set, sums daily sales per month and sets sale_date to month start (YYYY-MM-01); forces freq=M in payload.',
     )
     parser.add_argument(
         '--base-url',
@@ -61,6 +113,7 @@ def main():
     log("Starting project forecast batch run")
 
     PROJECT = args.project
+    as_of_date = _parse_as_of_date(args.as_of_date)
     BATCH_SIZE = args.batch_size
     FORECAST_PERIODS = args.forecast_periods
     LOCAL_MODEL = args.local_model
@@ -122,6 +175,13 @@ def main():
             save_progress(progress_path, completed)
             continue
 
+        df_hist, as_of_eff = _apply_as_of_cutoff(df_hist, as_of_date)
+        if df_hist.empty:
+            log(f"Batch {batch_no}: no history rows after applying as_of_date={args.as_of_date}; skipping.", since=batch_start)
+            completed.add(batch_no)
+            save_progress(progress_path, completed)
+            continue
+
         if args.aggregate_monthly:
             df_hist = _aggregate_monthly_sales(df_hist)
         sim_input_his = _format_sim_input(df_hist)
@@ -133,7 +193,7 @@ def main():
             'mode': 'local',
             'local_model': LOCAL_MODEL,
             'season_length': SEASON_LENGTH,
-            'freq': 'MS' if args.aggregate_monthly else FREQ,
+            'freq': 'M' if args.aggregate_monthly else FREQ,
         }
 
         if args.dry_run:
@@ -193,25 +253,33 @@ def main():
             continue
 
         # Parse into dataframe
-        df_new = _parse_nostradamus_response(resp_json, project=PROJECT, fm_override=LOCAL_MODEL)
+        df_new = _parse_nostradamus_response(
+            resp_json,
+            project=PROJECT,
+            fm_override=LOCAL_MODEL,
+            as_of_date=as_of_eff,
+            freq=payload.get('freq'),
+        )
         if df_new.empty:
             log("Parser returned no rows for this batch. Inspect raw response.", since=batch_start)
             continue
 
-        run_tag = time.strftime('%Y%m%d_%H%M%S')
         df_new = df_new.copy()
-        df_new['forecast_method'] = df_new['forecast_method'].astype(str) + '@' + run_tag
 
         # Insert into DB: keep each run distinct by tagging forecast_method
         con = get_connection()
         try:
             con.register('forecasts_api_df', df_new)
+            con.execute(
+                'DELETE FROM forecasts WHERE project = ? AND (item_id, forecast_method) IN (SELECT DISTINCT item_id, forecast_method FROM forecasts_api_df)',
+                [PROJECT],
+            )
             con.execute('INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df')
         finally:
             con.close()
 
         log(
-            f"Batch {batch_no}/{num_batches} complete: inserted {len(df_new)} rows (tagged @{run_tag}).",
+            f"Batch {batch_no}/{num_batches} complete: inserted {len(df_new)} rows (overwrote existing for same method).",
             since=batch_start,
         )
 
