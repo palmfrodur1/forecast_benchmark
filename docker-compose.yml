@@ -1,0 +1,36 @@
+services:
+  app:
+    build:
+      context: .
+    ports:
+      - "8501:8501"
+    environment:
+      # Inside the container, the named volume is mounted at /duckdb
+      BENCHMARK_DB_PATH: /duckdb/sog.duckdb
+    volumes:
+      # Mount the named volume containing the DuckDB file
+      - duckdb_workspace:/duckdb
+
+  # One-shot seeding job: copies ./sog.duckdb into the named volume at /duckdb/sog.duckdb
+  # Run once on a new machine:
+  #   docker compose --profile seed run --rm seed_db
+  seed_db:
+    image: alpine:3.20
+    profiles: ["seed"]
+    volumes:
+      - duckdb_workspace:/duckdb
+      - .:/seed:ro
+    command: >
+      sh -lc "
+        if [ -f /duckdb/sog.duckdb ]; then
+          echo 'duckdb_workspace already contains /duckdb/sog.duckdb';
+        else
+          test -f /seed/sog.duckdb || (echo 'Missing ./sog.duckdb to seed from' && exit 2);
+          cp /seed/sog.duckdb /duckdb/sog.duckdb && echo 'Seeded /duckdb/sog.duckdb into duckdb_workspace';
+        fi
+      "
+
+volumes:
+  duckdb_workspace:
+    # Use the existing named volume (or create it with this exact name)
+    name: duckdb_workspace
