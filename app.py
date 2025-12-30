@@ -11,6 +11,7 @@ import json
 import os
 import time
 from urllib.parse import urlparse, urlunparse
+from client_lightgpt import call_lightgpt_batch
 
 from nav import render_sidebar_nav
 
@@ -75,6 +76,10 @@ def _format_sim_input(df_history: pd.DataFrame) -> list:
         return out
     # Ensure date and sorting; drop rows with invalid dates
     df = df_history.copy()
+    # Defensive: if upstream code accidentally produced duplicate column labels
+    # (e.g., two 'item_id' columns), Pandas operations like sort_values will fail.
+    if not df.columns.is_unique:
+        df = df.loc[:, ~df.columns.duplicated()].copy()
     # coerce to datetime and drop NaT
     df['sale_date'] = pd.to_datetime(df['sale_date'], errors='coerce')
     df = df[df['sale_date'].notna()].copy()
@@ -558,6 +563,234 @@ def _generate_forecast_dates(as_of: date, periods: int, freq: str) -> list[date]
     return [pd.Timestamp(d).date() for d in rng]
 
 
+def _bool_env(name: str, default: str = '0') -> bool:
+    return str(os.getenv(name, default)).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _get_lightgpt_settings() -> tuple[str, str]:
+    """Return (base_url, api_key) for LightGPT.
+
+    LightGPT lives on the same Nostradamus API base URL.
+    We reuse the existing Nostradamus settings + API key.
+    """
+
+    base_url = (st.session_state.get('nostradamus_api_base_url') or '').strip()
+    api_key = (st.session_state.get('nostradamus_api_key') or os.getenv('NOSTRADAMUS_API_KEY') or os.getenv('API_KEY') or '').strip()
+    return base_url, api_key
+
+
+def _load_item_features(project: str) -> pd.DataFrame:
+    con = get_connection()
+    df = con.execute(
+        """
+        SELECT project, item_id, name, item_type, flavour, size
+        FROM item_features
+        WHERE project = ?
+        ORDER BY item_id
+        """,
+        [project],
+    ).fetchdf()
+    con.close()
+
+    # Normalize item_id to str
+    if not df.empty and 'item_id' in df.columns:
+        df['item_id'] = df['item_id'].astype(str)
+    return df
+
+
+def _load_item_features_all() -> pd.DataFrame:
+    con = get_connection()
+    df = con.execute(
+        """
+        SELECT project, item_id, name, item_type, flavour, size
+        FROM item_features
+        ORDER BY project, item_id
+        """
+    ).fetchdf()
+    con.close()
+
+    if not df.empty:
+        df['project'] = df['project'].astype(str)
+        df['item_id'] = df['item_id'].astype(str)
+    return df
+
+
+@st.cache_data
+def _get_item_features_history_date_range() -> tuple[date | None, date | None]:
+    con = get_connection()
+    df = con.execute(
+        """
+        SELECT MIN(s.sale_date) AS min_date, MAX(s.sale_date) AS max_date
+        FROM sales_history s
+        JOIN item_features f
+          ON s.project = f.project
+         AND s.item_id = f.item_id
+        """
+    ).fetchdf()
+    con.close()
+    if df.empty or df.iloc[0].isna().any():
+        return None, None
+    return pd.to_datetime(df.iloc[0]['min_date']).date(), pd.to_datetime(df.iloc[0]['max_date']).date()
+
+
+def _lightgpt_external_item_id(project: str, item_id: str) -> str:
+    return f"{project}::{item_id}"
+
+
+def _build_lightgpt_payload(
+    *,
+    features_df: pd.DataFrame,
+    hist_df: pd.DataFrame,
+    forecast_periods: int,
+
+) -> tuple[dict, dict[str, date], dict[str, tuple[str, str]]]:
+    """Build LightGPT request payload (OpenAPI LightGPTForecastRequest).
+
+    We send:
+    - sim_input_his: list of {item_id, actual_sale, day} at monthly frequency (month-start)
+    - item_attributes: list of {item_id, name, item_type, flavour, size}
+    - forecast_periods: int
+    """
+
+    if hist_df.empty:
+        return {}, {}, {}
+
+    df_hist = hist_df.copy()
+    df_hist['sale_date'] = pd.to_datetime(df_hist['sale_date'], errors='coerce')
+    df_hist = df_hist[df_hist['sale_date'].notna()].copy()
+    if df_hist.empty:
+        return {}, {}, {}
+
+    # Monthly aggregate to month-start
+    df_hist['sale_date'] = df_hist['sale_date'].dt.to_period('M').dt.to_timestamp(how='start')
+    df_hist['project'] = df_hist['project'].astype(str)
+    df_hist['item_id'] = df_hist['item_id'].astype(str)
+    df_hist = (
+        df_hist.groupby(['project', 'item_id', 'sale_date'], as_index=False)['sales']
+        .sum()
+        .sort_values(['project', 'item_id', 'sale_date'])
+    )
+    # LightGPT tends to expect non-negative demand signals; also avoid NaNs.
+    df_hist['sales'] = pd.to_numeric(df_hist['sales'], errors='coerce').fillna(0.0)
+    df_hist.loc[df_hist['sales'] < 0, 'sales'] = 0.0
+    df_hist['sale_date'] = df_hist['sale_date'].dt.date
+
+    # Disambiguate across projects
+    df_hist['ext_item_id'] = df_hist.apply(
+        lambda r: _lightgpt_external_item_id(str(r['project']), str(r['item_id'])),
+        axis=1,
+    )
+
+    # as_of per item = last observed month in (monthly aggregated) history
+    as_of_map: dict[str, date] = df_hist.groupby('ext_item_id')['sale_date'].max().to_dict() if not df_hist.empty else {}
+    id_map: dict[str, tuple[str, str]] = (
+        df_hist.groupby('ext_item_id')[['project', 'item_id']].first().apply(tuple, axis=1).to_dict()
+        if not df_hist.empty else {}
+    )
+
+    # IMPORTANT: avoid creating duplicate 'item_id' columns by selecting ext_item_id only.
+    df_for_sim = df_hist[['ext_item_id', 'sale_date', 'sales']].copy()
+    df_for_sim = df_for_sim.rename(columns={'ext_item_id': 'item_id'})
+    sim_input_his = _format_sim_input(df_for_sim)
+
+    feat = features_df.copy()
+    feat['project'] = feat['project'].astype(str)
+    feat['item_id'] = feat['item_id'].astype(str)
+    item_attributes = []
+    for _, r in feat.iterrows():
+        ext_id = _lightgpt_external_item_id(str(r.get('project')), str(r.get('item_id')))
+        item_attributes.append(
+            {
+                'item_id': ext_id,
+                'name': None if pd.isna(r.get('name')) else str(r.get('name')),
+                'item_type': None if pd.isna(r.get('item_type')) else str(r.get('item_type')),
+                'flavour': None if pd.isna(r.get('flavour')) else str(r.get('flavour')),
+                'size': None if pd.isna(r.get('size')) else str(r.get('size')),
+            }
+        )
+
+    payload = {
+        'sim_input_his': sim_input_his,
+        'item_attributes': item_attributes,
+        'forecast_periods': int(forecast_periods),
+        'forecast_type': 'batch',
+    }
+    return payload, as_of_map, id_map
+
+
+def _parse_lightgpt_response(
+    resp: dict,
+    *,
+    run_tag: str,
+    as_of_map: dict[str, date],
+    id_map: dict[str, tuple[str, str]],
+    forecast_periods: int,
+) -> pd.DataFrame:
+    """Parse LightGPT response into the shared `forecasts` table shape.
+
+    Supported response shapes (best-effort):
+    - {"forecasts": [{"item_id":..., "forecast":[...], "forecast_dates":[...]}]}
+    - {"results":  [{"item_id":..., "forecast":[...], "forecast_dates":[...]}]}
+    - {"items":    [{"item_id":..., "forecast":[...]}]}  (dates auto-generated from as_of_map)
+    """
+
+    if not isinstance(resp, dict):
+        return pd.DataFrame([])
+
+    forecasts = resp.get('forecasts') or resp.get('results') or resp.get('items') or []
+    if not isinstance(forecasts, list):
+        return pd.DataFrame([])
+
+    rows: list[dict] = []
+    method = f"lightgpt@{run_tag}"
+
+    for it in forecasts:
+        if not isinstance(it, dict):
+            continue
+        ext_item_id = it.get('item_id') or it.get('item') or it.get('sku')
+        if ext_item_id is None:
+            continue
+        ext_item_id = str(ext_item_id)
+
+        mapped = id_map.get(ext_item_id)
+        if not mapped and '::' in ext_item_id:
+            p, i = ext_item_id.split('::', 1)
+            mapped = (p, i)
+        if not mapped:
+            continue
+        project, item_id = mapped
+
+        vals = it.get('forecast') or it.get('forecasts') or it.get('values')
+        dates = it.get('forecast_dates') or it.get('dates')
+
+        if not isinstance(vals, list):
+            continue
+
+        # If no dates returned, generate monthly dates from the item's as_of date
+        if not isinstance(dates, list) or len(dates) != len(vals):
+            as_of = as_of_map.get(ext_item_id)
+            if as_of is None:
+                continue
+            gen_dates = _generate_forecast_dates(as_of, int(len(vals) or forecast_periods), 'M')
+            dates = [d.isoformat() for d in gen_dates[: len(vals)]]
+
+        for d, v in zip(dates, vals):
+            try:
+                rows.append(
+                    {
+                        'project': project,
+                        'forecast_method': method,
+                        'item_id': item_id,
+                        'forecast_date': pd.to_datetime(d).date(),
+                        'forecast': float(v),
+                    }
+                )
+            except Exception:
+                continue
+
+    return pd.DataFrame(rows)
+
+
 def main():
     st.title("Forecast Benchmark Explorer")
 
@@ -589,6 +822,8 @@ def main():
             key='timegpt_api_key',
             help='Only used when Mode=timegpt; sent in the request payload.',
         )
+
+        # LightGPT uses the same Nostradamus base URL + key; feature-flag only.
 
     projects = get_projects()
     if not projects:
@@ -651,6 +886,54 @@ def main():
     selected_methods = methods
 
     st.sidebar.markdown("---")
+
+    # --- LightGPT batch forecast section (feature-flagged) ---
+    if _bool_env('ENABLE_LIGHTGPT', '0'):
+        if st.sidebar.button("Generate LightGPT forecasts (item_features)"):
+            next_open = not bool(st.session_state.get('_show_lightgpt_forecast', False))
+            st.session_state['_show_lightgpt_forecast'] = next_open
+            if next_open:
+                st.session_state['_show_project_forecast'] = False
+                st.session_state['_show_item_forecast'] = False
+
+        if st.session_state.get('_show_lightgpt_forecast'):
+            with st.sidebar.container():
+                st.markdown("**LightGPT batch parameters**")
+                with st.form('lightgpt_form'):
+                    min_lg, max_lg = _get_item_features_history_date_range()
+                    max_eff = _effective_as_of_for_monthly(max_lg) if max_lg else None
+                    lg_periods = st.number_input(
+                        'Forecast periods (months)',
+                        min_value=1,
+                        max_value=120,
+                        value=12,
+                        key='lightgpt_forecast_periods',
+                    )
+                    lg_as_of = st.date_input(
+                        'Forecast as-of date',
+                        value=max_eff if max_eff else datetime.now().date(),
+                        min_value=min_lg,
+                        max_value=max_lg,
+                        key='lightgpt_as_of_date',
+                        help='History is truncated to this date; monthly forecasts start after this date (month-aligned).',
+                    )
+                    lg_timeout = st.number_input(
+                        'Request timeout (s)',
+                        min_value=10,
+                        max_value=600,
+                        value=60,
+                        key='lightgpt_timeout_seconds',
+                    )
+                    submitted_lg = st.form_submit_button('Run LightGPT batch')
+
+                if submitted_lg:
+                    st.session_state['_show_lightgpt_forecast'] = False
+                    st.session_state['_lightgpt_forecast_request'] = {
+                        'forecast_periods': int(lg_periods),
+                        'as_of_date': lg_as_of.isoformat() if lg_as_of else None,
+                        'timeout_seconds': int(lg_timeout),
+                    }
+                    st.rerun()
 
     # --- Project forecast section (button + parameters directly underneath) ---
     if st.sidebar.button("Generate forecasts for project"):
@@ -828,6 +1111,122 @@ def main():
                 st.rerun()
 
     # --- Forecast execution (main area) ---
+    lightgpt_req = st.session_state.pop('_lightgpt_forecast_request', None)
+    if lightgpt_req:
+        st.markdown('---')
+        st.subheader('LightGPT batch run')
+
+        run_tag = _run_suffix()
+        st.caption(f"Run tag: @\"{run_tag}\" (saved as method lightgpt@{run_tag})")
+
+        features_df = _load_item_features_all()
+        if features_df.empty:
+            st.error('No rows found in item_features.')
+        else:
+            con = get_connection()
+            try:
+                hist_df = con.execute(
+                    """
+                    SELECT s.project, s.item_id, s.sale_date, s.sales
+                    FROM sales_history s
+                    JOIN item_features f
+                      ON s.project = f.project
+                     AND s.item_id = f.item_id
+                    ORDER BY s.project, s.item_id, s.sale_date
+                    """
+                ).fetchdf()
+            finally:
+                con.close()
+
+            if hist_df.empty:
+                st.error('No sales_history rows found for item_features items.')
+            else:
+                as_of_date = None
+                if lightgpt_req.get('as_of_date'):
+                    try:
+                        as_of_date = pd.to_datetime(lightgpt_req['as_of_date']).date()
+                    except Exception:
+                        as_of_date = None
+
+                if as_of_date is not None:
+                    # For monthly runs, use a month-end aligned cutoff to avoid partial months.
+                    eff_as_of = _effective_as_of_for_monthly(as_of_date)
+                    hist_df, _ = _apply_as_of_cutoff(hist_df, eff_as_of)
+
+                payload, as_of_map, id_map = _build_lightgpt_payload(
+                    features_df=features_df,
+                    hist_df=hist_df,
+                    forecast_periods=int(lightgpt_req['forecast_periods']),
+                )
+                if not payload.get('sim_input_his'):
+                    st.error('Could not build LightGPT payload (no usable histories).')
+                else:
+                    base_url, key = _get_lightgpt_settings()
+                    base_url = _normalize_localhost_url(base_url)
+                    if not base_url:
+                        st.error('Nostradamus API base URL is not set.')
+                    else:
+                        if not key:
+                            st.warning(
+                                "No Nostradamus API key is set. We'll call LightGPT without X-API-Key. "
+                                "If the hosted API returns an error, the response body will be shown to help diagnose it."
+                            )
+                        st.caption('Sending item_features batch to LightGPT (monthly).')
+                        try:
+                            resp = call_lightgpt_batch(
+                                base_url,
+                                payload,
+                                api_key=(key or None),
+                                timeout_s=float(lightgpt_req['timeout_seconds']),
+                            )
+                        except Exception as e:
+                            st.error(f'LightGPT request failed: {e}')
+                            resp = None
+
+                        if resp is not None:
+                            with st.expander('LightGPT response', expanded=False):
+                                st.json(resp)
+
+                            df_new = _parse_lightgpt_response(
+                                resp,
+                                run_tag=run_tag,
+                                as_of_map=as_of_map,
+                                id_map=id_map,
+                                forecast_periods=int(lightgpt_req['forecast_periods']),
+                            )
+
+                            if df_new.empty:
+                                st.error('Could not parse any forecast rows from LightGPT response.')
+                            else:
+                                con = get_connection()
+                                try:
+                                    df_new = df_new.copy()
+                                    con.register('forecasts_lightgpt_df', df_new)
+                                    # Overwrite previous LightGPT runs for these items (base method lightgpt).
+                                    con.execute(
+                                        """
+                                        DELETE FROM forecasts
+                                        WHERE split_part(forecast_method, '@', 1) = 'lightgpt'
+                                          AND (project, item_id) IN (
+                                              SELECT DISTINCT project, item_id
+                                              FROM forecasts_lightgpt_df
+                                          )
+                                        """
+                                    )
+                                    con.execute(
+                                        """
+                                        INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast)
+                                        SELECT project, forecast_method, item_id, forecast_date, forecast
+                                        FROM forecasts_lightgpt_df
+                                        """
+                                    )
+                                finally:
+                                    con.close()
+
+                                st.success(f"Saved {len(df_new)} LightGPT forecast rows.")
+                                st.cache_data.clear()
+                                st.rerun()
+
     project_req = st.session_state.pop('_project_forecast_request', None)
     if project_req:
         st.markdown('---')
@@ -1005,12 +1404,21 @@ def main():
         st.subheader('Item forecast run')
 
         con = get_connection()
-        sql = "SELECT item_id, sale_date, sales FROM sales_history WHERE project = ? AND item_id = ? ORDER BY sale_date"
-        params = [item_req['project'], item_req['item_id']]
-        df_hist_item = con.execute(sql, params).fetchdf()
-        con.close()
+        try:
+            df_hist = con.execute(
+                """
+                SELECT item_id, sale_date, sales
+                FROM sales_history
+                WHERE project = ?
+                  AND item_id = ?
+                ORDER BY item_id, sale_date
+                """,
+                [item_req['project'], item_req['item_id']],
+            ).fetchdf()
+        finally:
+            con.close()
 
-        if df_hist_item.empty:
+        if df_hist.empty:
             st.error("No sales history found for this item.")
         else:
             as_of_date_item = None
@@ -1021,33 +1429,34 @@ def main():
                     as_of_date_item = None
 
             if as_of_date_item is not None:
-                df_hist_item, _ = _apply_as_of_cutoff(df_hist_item, as_of_date_item)
-                if df_hist_item.empty:
+                df_hist, _ = _apply_as_of_cutoff(df_hist, as_of_date_item)
+                if df_hist.empty:
                     st.error("No history rows left after applying as-of date.")
                     return
 
             if item_req['aggregate_monthly']:
-                df_hist_item = _aggregate_monthly_sales(df_hist_item)
+                df_hist = _aggregate_monthly_sales(df_hist)
 
-            sim_input_his = _format_sim_input(df_hist_item)
-            if len(sim_input_his) < 1:
-                st.error("No valid sale_date rows to send. Check your data.")
-            else:
-                payload = {
-                    'sim_input_his': sim_input_his,
-                    'forecast_periods': int(item_req['forecast_periods']),
-                    'mode': item_req['run_mode'],
-                    'local_model': item_req['local_model'],
-                    'season_length': int(item_req['season_length']),
-                    'freq': 'M' if item_req['aggregate_monthly'] else item_req['freq'],
-                }
-                if item_req['quantiles_text'].strip():
-                    try:
-                        quantiles = [float(q.strip()) for q in item_req['quantiles_text'].split(',') if q.strip()]
-                        payload['quantiles'] = quantiles
-                    except Exception:
-                        st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
-                        payload = None
+            sim_input_his = _format_sim_input(df_hist)
+            if len(sim_input_his) < 5:
+                st.warning("Less than 5 data points — some models may not work well.")
+
+            payload = {
+                'sim_input_his': sim_input_his,
+                'forecast_periods': int(item_req['forecast_periods']),
+                'mode': item_req['run_mode'],
+                'local_model': item_req['local_model'],
+                'season_length': int(item_req['season_length']),
+                'freq': 'M' if item_req['aggregate_monthly'] else item_req['freq'],
+            }
+
+            if item_req['quantiles_text'].strip():
+                try:
+                    quantiles = [float(q.strip()) for q in item_req['quantiles_text'].split(',') if q.strip()]
+                    payload['quantiles'] = quantiles
+                except Exception:
+                    st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
+                    payload = None
 
                 if payload is not None:
                     if item_req['run_mode'] == 'timegpt' and item_req['api_key']:
