@@ -1,0 +1,10 @@
+services:
+  app_mysql:
+    build:
+      context: .
+    ports:
+      - "8502:8501"
+    # Uses your local .env (git-ignored) for MYSQL_HOST/PORT/USER/PASSWORD/DATABASE
+    env_file:
+      - .env
+    command: ["streamlit", "run", "app_mysql.py", "--server.address=0.0.0.0", "--server.port=8501"]

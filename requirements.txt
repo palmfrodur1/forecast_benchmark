@@ -5,3 +5,6 @@ altair
 requests
 fastapi
 uvicorn
+sqlalchemy
+pymysql
+python-dotenv

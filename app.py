@@ -21,6 +21,9 @@ DEFAULT_NOSTRADAMUS_API_BASE_URL = os.getenv('NOSTRADAMUS_API_BASE_URL', 'https:
 
 st.set_page_config(page_title='View per Item')
 
+# Used by nav.render_sidebar_nav() to link to the correct entrypoint file.
+st.session_state['_entrypoint'] = 'app.py'
+
 render_sidebar_nav()
 
 
