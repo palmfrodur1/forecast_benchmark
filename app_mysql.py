@@ -70,7 +70,7 @@ def _aggregate_monthly_history_series(history_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def get_projects() -> list[str]:
     df = _read_df("SELECT DISTINCT project FROM sales_history ORDER BY project")
     if df.empty:
@@ -78,7 +78,7 @@ def get_projects() -> list[str]:
     return df["project"].astype(str).tolist()
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def get_items(project: str) -> list[str]:
     df = _read_df(
         """
@@ -94,7 +94,7 @@ def get_items(project: str) -> list[str]:
     return df["item_id"].astype(str).tolist()
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def get_forecast_methods(project: str, item_id: str) -> list[str]:
     df = _read_df(
         """
@@ -110,7 +110,7 @@ def get_forecast_methods(project: str, item_id: str) -> list[str]:
     return df["forecast_method"].astype(str).tolist()
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_series(project: str, item_id: str, methods: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     history = _read_df(
         """
@@ -161,7 +161,7 @@ def load_series(project: str, item_id: str, methods: list[str]) -> tuple[pd.Data
     return history, forecasts, combined
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_metrics(project: str, item_id: str, methods: list[str]) -> pd.DataFrame:
     if not methods:
         return pd.DataFrame(columns=["forecast_method", "metric_name", "metric_value", "n_points"])
@@ -198,7 +198,7 @@ def load_metrics(project: str, item_id: str, methods: list[str]) -> pd.DataFrame
     return _read_df(sql, params)
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def get_history_date_range(project: str, item_id: str | None = None) -> tuple[date | None, date | None]:
     if item_id is None:
         df = _read_df(

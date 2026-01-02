@@ -38,19 +38,39 @@ def load_env() -> None:
     """
 
     global _DOTENV_LOADED
-    if _DOTENV_LOADED:
-        return
-    _DOTENV_LOADED = True
-
-    try:
-        from dotenv import load_dotenv  # type: ignore
-    except Exception:
+    # If we've already loaded and key vars are present, no-op.
+    # If vars are missing (e.g., Streamlit hot-reload after creating .env), retry.
+    if _DOTENV_LOADED and os.getenv("MYSQL_PASSWORD"):
         return
 
     # Repo root is the same folder as this file.
     env_path = Path(__file__).resolve().parent / ".env"
-    if env_path.exists():
-        load_dotenv(dotenv_path=env_path)
+    if not env_path.exists():
+        return
+
+    _DOTENV_LOADED = True
+
+    # Prefer python-dotenv if available, but fall back to a tiny parser so local
+    # development doesn't depend on that package.
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if not key:
+                continue
+            # Do not override existing environment variables.
+            os.environ.setdefault(key, value)
+        return
+
+    load_dotenv(dotenv_path=env_path)
 
 
 class DBBackend(str, Enum):
@@ -64,6 +84,14 @@ def _env(name: str, default: str | None = None) -> str | None:
         return default
     v = v.strip()
     return v if v else default
+
+
+def _env_any(names: list[str], default: str | None = None) -> str | None:
+    for name in names:
+        v = _env(name)
+        if v is not None:
+            return v
+    return default
 
 
 def get_db_backend() -> DBBackend:
@@ -154,11 +182,12 @@ Env vars:
 Note: We intentionally do NOT hardcode passwords in the repo.
 """
 
-    host = _env("MYSQL_HOST", "192.168.1.50") or "192.168.1.50"
-    port_raw = _env("MYSQL_PORT", "4406") or "4406"
-    user = _env("MYSQL_USER", "root") or "root"
-    password = _env("MYSQL_PASSWORD", "") or ""
-    database = _env("MYSQL_DATABASE", "forecast_benchmark") or "forecast_benchmark"
+    # Prefer MYSQL_*; fall back to SANDBOX_DB_* for older deployments.
+    host = _env_any(["MYSQL_HOST", "SANDBOX_DB_HOST"], "192.168.1.50") or "192.168.1.50"
+    port_raw = _env_any(["MYSQL_PORT", "SANDBOX_DB_PORT"], "4406") or "4406"
+    user = _env_any(["MYSQL_USER", "SANDBOX_DB_USER"], "root") or "root"
+    password = _env_any(["MYSQL_PASSWORD", "SANDBOX_DB_PASSWORD"], "") or ""
+    database = _env_any(["MYSQL_DATABASE", "SANDBOX_DB_DATABASE"], "forecast_benchmark") or "forecast_benchmark"
     try:
         port = int(port_raw)
     except Exception:
@@ -178,7 +207,8 @@ def get_mysql_engine(*, database: str | None = None, echo: bool = False):
     cfg = get_mysql_config()
     if not cfg.password:
         raise RuntimeError(
-            "MYSQL_PASSWORD is not set. Create a local .env (ignored by git) and set MYSQL_PASSWORD."
+            "MySQL password is not set. Set MYSQL_PASSWORD (preferred) or SANDBOX_DB_PASSWORD. "
+            "For local dev, create a local .env (ignored by git) next to db.py."
         )
     url = sa.engine.URL.create(
         drivername="mysql+pymysql",
