@@ -735,6 +735,7 @@ def _parse_lightgpt_response(
     - {"forecasts": [{"item_id":..., "forecast":[...], "forecast_dates":[...]}]}
     - {"results":  [{"item_id":..., "forecast":[...], "forecast_dates":[...]}]}
     - {"items":    [{"item_id":..., "forecast":[...]}]}  (dates auto-generated from as_of_map)
+    - {"forecasts": [{"item_id":..., "day": "YYYY-MM-DD...", "forecast": 123.4}, ...]} (row-wise)
     """
 
     if not isinstance(resp, dict):
@@ -762,6 +763,31 @@ def _parse_lightgpt_response(
         if not mapped:
             continue
         project, item_id = mapped
+
+        # Row-wise shape: each element is a single forecast row with a date field.
+        # Example: {"item_id": "Project::123", "day": "2024-11-02T00:00:00", "forecast": 807.75}
+        date_field = (
+            it.get('forecast_date')
+            or it.get('day')
+            or it.get('date')
+            or it.get('ds')
+            or it.get('timestamp')
+        )
+        value_field = it.get('forecast')
+        if date_field is not None and isinstance(value_field, (int, float, str)):
+            try:
+                rows.append(
+                    {
+                        'project': project,
+                        'forecast_method': method,
+                        'item_id': item_id,
+                        'forecast_date': pd.to_datetime(date_field).date(),
+                        'forecast': float(value_field),
+                    }
+                )
+            except Exception:
+                pass
+            continue
 
         vals = it.get('forecast') or it.get('forecasts') or it.get('values')
         dates = it.get('forecast_dates') or it.get('dates')
