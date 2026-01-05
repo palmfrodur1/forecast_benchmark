@@ -1,10 +1,13 @@
+import os
 import pandas as pd
 import streamlit as st
 
 from datetime import date
 
-from db import get_connection
-from metrics import recompute_all_metrics
+import sqlalchemy as sa
+
+from db import get_connection, get_mysql_engine
+from metrics import recompute_all_metrics, recompute_all_metrics_mysql
 
 from nav import render_sidebar_nav
 
@@ -14,19 +17,41 @@ st.set_page_config(page_title="Scoreboard", layout="wide")
 render_sidebar_nav()
 
 
-@st.cache_data
+def _use_mysql() -> bool:
+    # When the user runs `streamlit run app_mysql.py`, we want Scoreboard to
+    # read from MySQL too (not DuckDB).
+    if st.session_state.get("_entrypoint") == "app_mysql.py":
+        return True
+    return (os.getenv("BENCHMARK_DB_BACKEND") or "").lower() == "mysql"
+
+
+@st.cache_resource
+def _mysql_engine() -> sa.Engine:
+    return get_mysql_engine()
+
+
+def _mysql_read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    eng = _mysql_engine()
+    with eng.connect() as conn:
+        return pd.read_sql(sa.text(sql), conn, params=params or {})
+
+
+@st.cache_data(ttl=60)
 def _get_projects() -> list[str]:
-    con = get_connection()
-    try:
-        df = con.execute(
-            "SELECT DISTINCT project FROM sales_history ORDER BY project"
-        ).fetchdf()
-    finally:
-        con.close()
+    if _use_mysql():
+        df = _mysql_read_df("SELECT DISTINCT project FROM sales_history ORDER BY project")
+    else:
+        con = get_connection()
+        try:
+            df = con.execute(
+                "SELECT DISTINCT project FROM sales_history ORDER BY project"
+            ).fetchdf()
+        finally:
+            con.close()
     return df["project"].dropna().astype(str).tolist()
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def _load_score_rows(project: str) -> pd.DataFrame:
     """Load latest metrics per (item, base_method, metric_name).
 
@@ -34,22 +59,21 @@ def _load_score_rows(project: str) -> pd.DataFrame:
     - Prefers untagged rows if present; otherwise chooses max(tag) as latest
     """
 
-    con = get_connection()
-    try:
-        df = con.execute(
+    if _use_mysql():
+        df = _mysql_read_df(
             """
             WITH ranked AS (
                 SELECT
                     project,
                     item_id,
-                    split_part(forecast_method, '@', 1) AS base_method,
+                    SUBSTRING_INDEX(forecast_method, '@', 1) AS base_method,
                     forecast_method,
                     metric_name,
                     metric_value,
                     n_points,
-                    CASE WHEN strpos(forecast_method, '@') = 0 THEN 1 ELSE 0 END AS is_untagged
+                    CASE WHEN LOCATE('@', forecast_method) = 0 THEN 1 ELSE 0 END AS is_untagged
                 FROM forecast_metrics
-                WHERE project = ?
+                WHERE project = :project
             ),
             chosen AS (
                 SELECT
@@ -62,7 +86,7 @@ def _load_score_rows(project: str) -> pd.DataFrame:
                         MAX(forecast_method)
                     ) AS chosen_method
                 FROM ranked
-                GROUP BY 1,2,3,4
+                GROUP BY project, item_id, base_method, metric_name
             )
             SELECT
                 r.item_id,
@@ -79,10 +103,58 @@ def _load_score_rows(project: str) -> pd.DataFrame:
              AND r.forecast_method = c.chosen_method
             ORDER BY r.item_id, r.base_method, r.metric_name
             """,
-            [project],
-        ).fetchdf()
-    finally:
-        con.close()
+            {"project": project},
+        )
+    else:
+        con = get_connection()
+        try:
+            df = con.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        project,
+                        item_id,
+                        split_part(forecast_method, '@', 1) AS base_method,
+                        forecast_method,
+                        metric_name,
+                        metric_value,
+                        n_points,
+                        CASE WHEN strpos(forecast_method, '@') = 0 THEN 1 ELSE 0 END AS is_untagged
+                    FROM forecast_metrics
+                    WHERE project = ?
+                ),
+                chosen AS (
+                    SELECT
+                        project,
+                        item_id,
+                        base_method,
+                        metric_name,
+                        COALESCE(
+                            MAX(CASE WHEN is_untagged = 1 THEN forecast_method END),
+                            MAX(forecast_method)
+                        ) AS chosen_method
+                    FROM ranked
+                    GROUP BY 1,2,3,4
+                )
+                SELECT
+                    r.item_id,
+                    r.base_method AS forecast_method,
+                    r.metric_name,
+                    r.metric_value,
+                    r.n_points
+                FROM ranked r
+                JOIN chosen c
+                  ON r.project = c.project
+                 AND r.item_id = c.item_id
+                 AND r.base_method = c.base_method
+                 AND r.metric_name = c.metric_name
+                 AND r.forecast_method = c.chosen_method
+                ORDER BY r.item_id, r.base_method, r.metric_name
+                """,
+                [project],
+            ).fetchdf()
+        finally:
+            con.close()
 
     if df.empty:
         return pd.DataFrame(columns=["item_id", "forecast_method", "metric_name", "metric_value", "n_points"])
@@ -95,16 +167,22 @@ def _load_score_rows(project: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def _get_project_date_bounds(project: str) -> tuple[date | None, date | None]:
-    con = get_connection()
-    try:
-        df = con.execute(
-            "SELECT MIN(sale_date) AS min_date, MAX(sale_date) AS max_date FROM sales_history WHERE project = ?",
-            [project],
-        ).fetchdf()
-    finally:
-        con.close()
+    if _use_mysql():
+        df = _mysql_read_df(
+            "SELECT MIN(sale_date) AS min_date, MAX(sale_date) AS max_date FROM sales_history WHERE project = :project",
+            {"project": project},
+        )
+    else:
+        con = get_connection()
+        try:
+            df = con.execute(
+                "SELECT MIN(sale_date) AS min_date, MAX(sale_date) AS max_date FROM sales_history WHERE project = ?",
+                [project],
+            ).fetchdf()
+        finally:
+            con.close()
     if df.empty or df.iloc[0].isna().any():
         return None, None
     return pd.to_datetime(df.iloc[0]["min_date"]).date(), pd.to_datetime(df.iloc[0]["max_date"]).date()
@@ -199,12 +277,20 @@ def main() -> None:
             return
         with st.spinner("Computing metrics for the selected period..."):
             try:
-                recompute_all_metrics(
-                    project=project,
-                    start_date=start_date,
-                    end_date=end_date,
-                    abs_actual_threshold=float(abs_actual_threshold),
-                )
+                if _use_mysql():
+                    recompute_all_metrics_mysql(
+                        project=project,
+                        start_date=start_date,
+                        end_date=end_date,
+                        abs_actual_threshold=float(abs_actual_threshold),
+                    )
+                else:
+                    recompute_all_metrics(
+                        project=project,
+                        start_date=start_date,
+                        end_date=end_date,
+                        abs_actual_threshold=float(abs_actual_threshold),
+                    )
                 st.cache_data.clear()
                 st.success("Metrics computed.")
                 st.rerun()

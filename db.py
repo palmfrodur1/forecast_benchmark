@@ -115,19 +115,22 @@ def _default_duckdb_path() -> Path:
     """Choose a sensible default DuckDB path.
 
 Preference order:
-1) Local repo file `./sog.duckdb` (local dev)
-2) Docker named volume mount path `/duckdb/sog.duckdb` (compose + run scripts)
-3) Legacy path `/duckdb_workspace/sog.duckdb` (older setups)
+1) Local repo file `./benchmark.duckdb` (local dev)
+2) Docker named volume mount path `/duckdb/benchmark.duckdb` (compose + run scripts)
+3) Legacy path `/duckdb_workspace/benchmark.duckdb` (older setups)
 """
-    local = Path(__file__).parent / "sog.duckdb"
+    local = Path(__file__).parent / "benchmark.duckdb"
     if local.exists():
         return local
 
-    for candidate in (Path("/duckdb/sog.duckdb"), Path("/duckdb_workspace/sog.duckdb")):
+    for candidate in (
+        Path("/duckdb/benchmark.duckdb"),
+        Path("/duckdb_workspace/benchmark.duckdb"),
+    ):
         if candidate.exists():
             return candidate
     # If nothing exists yet, default to the modern container path.
-    return Path("/duckdb/sog.duckdb")
+    return Path("/duckdb/benchmark.duckdb")
 
 
 @dataclass(frozen=True)

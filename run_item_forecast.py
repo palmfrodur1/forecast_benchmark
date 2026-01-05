@@ -60,7 +60,12 @@ def _parse_nostradamus_response(
 
     for it in forecasts:
         item_id = it.get('item_id') or it.get('item') or it.get('sku')
-        fm = it.get('model_used') or top_model or fm_override or 'unknown'
+        model_used = it.get('model_used')
+        if str(fm_override or '').strip().lower() == 'auto_model':
+            resolved = model_used or top_model or 'unknown'
+            fm = f"AM:{resolved}"
+        else:
+            fm = model_used or fm_override or top_model or 'unknown'
 
         vals = it.get('forecast') or it.get('forecasts') or it.get('values')
         dates = it.get('forecast_dates') or it.get('dates') or it.get('forecast_date')

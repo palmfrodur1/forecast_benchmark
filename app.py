@@ -269,8 +269,18 @@ def _parse_nostradamus_response(
 
     for it in forecasts:
         item_id = it.get('item_id') or it.get('item') or it.get('sku')
-        # prefer per-item model_used then top-level model then override
-        fm = it.get('model_used') or top_model or fm_override or 'unknown'
+        model_used = it.get('model_used')
+
+        # Special case: if the user requested AutoModel, keep that provenance
+        # visible but record the actual model returned by Nostradamus.
+        # Example: user selects auto_model, API returns model_used=auto_arima -> AM:auto_arima
+        if str(fm_override or '').strip().lower() == 'auto_model':
+            resolved = model_used or top_model or 'unknown'
+            fm = f"AM:{resolved}"
+        else:
+            # Prefer per-item model_used if present; otherwise prefer explicit override
+            # (the user-selected local model) before falling back to a top-level model.
+            fm = model_used or fm_override or top_model or 'unknown'
 
         vals = it.get('forecast') or it.get('forecasts') or it.get('values')
         dates = it.get('forecast_dates') or it.get('dates') or it.get('forecast_date')
@@ -1011,6 +1021,10 @@ def main():
                 batch_size_items = st.number_input("Batch size (items per job)", min_value=1, max_value=5000, value=500, key='proj_batch_size_items')
                 min_d, max_d = get_history_date_range(project)
                 if min_d and max_d:
+                    # Sticky default: if the widget key disappeared (panel closed), restore last choice.
+                    if 'proj_as_of_date' not in st.session_state and st.session_state.get('proj_as_of_date_last') is not None:
+                        st.session_state['proj_as_of_date'] = st.session_state.get('proj_as_of_date_last')
+
                     prev = st.session_state.get('proj_as_of_date')
                     if prev is not None:
                         try:
@@ -1040,6 +1054,8 @@ def main():
 
             if submitted:
                 st.session_state['_show_project_forecast'] = False
+                # Remember as-of date so it stays sticky when reopening the panel.
+                st.session_state['proj_as_of_date_last'] = as_of_date_project
                 st.session_state['_project_forecast_request'] = {
                     'project': project,
                     'run_mode': run_mode,
@@ -1097,6 +1113,10 @@ def main():
                 forecast_periods_item = st.number_input("Forecast periods", min_value=1, max_value=365, value=12, key='item_forecast_periods')
                 min_di, max_di = get_history_date_range(project, item_id=item_id)
                 if min_di and max_di:
+                    # Sticky default: if the widget key disappeared (panel closed), restore last choice.
+                    if 'item_as_of_date' not in st.session_state and st.session_state.get('item_as_of_date_last') is not None:
+                        st.session_state['item_as_of_date'] = st.session_state.get('item_as_of_date_last')
+
                     prev = st.session_state.get('item_as_of_date')
                     if prev is not None:
                         try:
@@ -1121,6 +1141,8 @@ def main():
 
             if submitted_item:
                 st.session_state['_show_item_forecast'] = False
+                # Remember as-of date so it stays sticky when reopening the panel.
+                st.session_state['item_as_of_date_last'] = as_of_date_item
                 st.session_state['_item_forecast_request'] = {
                     'project': project,
                     'item_id': item_id,
@@ -1487,108 +1509,110 @@ def main():
                     st.error("Invalid quantiles format. Use comma-separated floats like: 0.1,0.5,0.9")
                     payload = None
 
-                if payload is not None:
-                    if item_req['run_mode'] == 'timegpt' and item_req['api_key']:
-                        payload['api_key'] = item_req['api_key']
-                    api_base_url_item = _normalize_localhost_url(item_req['api_base_url'])
-                    if api_base_url_item != item_req['api_base_url']:
-                        st.warning(f"Using {api_base_url_item} (localhost usually doesn't use TLS).")
+            if payload is None:
+                return
 
-                    # Diagnostics to understand "one item" job size and duration.
-                    st.caption(f"Prepared sim_input_his with {len(sim_input_his)} rows.")
-                    if len(sim_input_his) > 5000:
-                        st.warning(
-                            "This item has a lot of history rows; even a single-item forecast can take a while. "
-                            "If you see timeouts, consider aggregating monthly or reducing history length on the API side."
-                        )
+            if item_req['run_mode'] == 'timegpt' and item_req['api_key']:
+                payload['api_key'] = item_req['api_key']
+            api_base_url_item = _normalize_localhost_url(item_req['api_base_url'])
+            if api_base_url_item != item_req['api_base_url']:
+                st.warning(f"Using {api_base_url_item} (localhost usually doesn't use TLS).")
 
-                    # Use async job flow to avoid Cloudflare 524 timeouts on long model fits.
-                    nostradamus_key = item_req.get('nostradamus_api_key') or None
-                    run_start = time.perf_counter()
-                    st.info("Submitting forecast job and waiting for result...")
-                    try:
-                        submit_start = time.perf_counter()
-                        resp = _submit_job(
-                            payload,
-                            base_url=api_base_url_item,
-                            webhook_url=None,
-                            timeout=min(30, int(item_req['timeout_seconds'])),
-                            api_key=nostradamus_key,
-                        )
-                        st.caption(
-                            f"Submitted job_id={resp.get('job_id')} in {time.perf_counter() - submit_start:.2f}s"
-                        )
-                    except Exception as e:
-                        st.error(f"Forecast job submission failed: {e}")
-                        resp = None
+            # Diagnostics to understand "one item" job size and duration.
+            st.caption(f"Prepared sim_input_his with {len(sim_input_his)} rows.")
+            if len(sim_input_his) > 5000:
+                st.warning(
+                    "This item has a lot of history rows; even a single-item forecast can take a while. "
+                    "If you see timeouts, consider aggregating monthly or reducing history length on the API side."
+                )
 
-                    status_url = (resp or {}).get('status_url')
-                    if resp is not None and not status_url:
-                        st.error(f"No status_url returned by API. job_id={(resp or {}).get('job_id')}")
-                        resp = None
+            # Use async job flow to avoid Cloudflare 524 timeouts on long model fits.
+            nostradamus_key = item_req.get('nostradamus_api_key') or None
+            run_start = time.perf_counter()
+            st.info("Submitting forecast job and waiting for result...")
+            try:
+                submit_start = time.perf_counter()
+                resp = _submit_job(
+                    payload,
+                    base_url=api_base_url_item,
+                    webhook_url=None,
+                    timeout=min(30, int(item_req['timeout_seconds'])),
+                    api_key=nostradamus_key,
+                )
+                st.caption(
+                    f"Submitted job_id={resp.get('job_id')} in {time.perf_counter() - submit_start:.2f}s"
+                )
+            except Exception as e:
+                st.error(f"Forecast job submission failed: {e}")
+                resp = None
 
-                    if resp is not None and status_url:
-                        try:
-                            poll_start = time.perf_counter()
-                            job = _poll_job_status(
-                                status_url,
-                                timeout=int(item_req['timeout_seconds']),
-                                api_key=nostradamus_key,
-                            )
-                            st.caption(
-                                f"Polling finished in {time.perf_counter() - poll_start:.2f}s "
-                                f"(total {time.perf_counter() - run_start:.2f}s)"
-                            )
-                        except Exception as e:
-                            st.error(f"Forecast polling failed: {e}")
-                            job = None
+            status_url = (resp or {}).get('status_url')
+            if resp is not None and not status_url:
+                st.error(f"No status_url returned by API. job_id={(resp or {}).get('job_id')}")
+                resp = None
 
-                        if not job or job.get('status') != 'finished' or not job.get('result'):
-                            st.error(
-                                f"Job ended with status={(job or {}).get('status')} error={(job or {}).get('error')}"
-                            )
-                            resp = None
-                        else:
-                            resp = job.get('result')
+            if resp is not None and status_url:
+                try:
+                    poll_start = time.perf_counter()
+                    job = _poll_job_status(
+                        status_url,
+                        timeout=int(item_req['timeout_seconds']),
+                        api_key=nostradamus_key,
+                    )
+                    st.caption(
+                        f"Polling finished in {time.perf_counter() - poll_start:.2f}s "
+                        f"(total {time.perf_counter() - run_start:.2f}s)"
+                    )
+                except Exception as e:
+                    st.error(f"Forecast polling failed: {e}")
+                    job = None
 
-                    if resp:
-                        with st.expander("Response", expanded=False):
-                            st.json(resp)
-                        df_new = _parse_nostradamus_response(
-                            resp,
-                            project=item_req['project'],
-                            fm_override=item_req['local_model'] if item_req['run_mode'] == 'local' else None,
-                            as_of_date=as_of_date_item,
-                            freq=payload.get('freq'),
-                        )
+                if not job or job.get('status') != 'finished' or not job.get('result'):
+                    st.error(
+                        f"Job ended with status={(job or {}).get('status')} error={(job or {}).get('error')}"
+                    )
+                    resp = None
+                else:
+                    resp = job.get('result')
 
-                        if df_new.empty:
-                            st.warning("Could not parse any forecast rows from response.")
-                        else:
-                            con = get_connection()
-                            df_new = df_new.copy()
-                            con.register('forecasts_api_df_item', df_new)
-                            con.execute(
-                                """
-                                DELETE FROM forecasts
-                                WHERE project = ?
-                                  AND item_id = ?
-                                  AND split_part(forecast_method, '@', 1) IN (
-                                      SELECT DISTINCT forecast_method FROM forecasts_api_df_item
-                                  )
-                                """,
-                                [item_req['project'], item_req['item_id']],
-                            )
-                            con.execute(
-                                "INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) "
-                                "SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item"
-                            )
-                            con.close()
-                            st.success(
-                                f"Saved {len(df_new)} forecast rows (overwrote existing for same method)."
-                            )
-                            st.cache_data.clear()
-                            st.rerun()
+            if resp:
+                with st.expander("Response", expanded=False):
+                    st.json(resp)
+                df_new = _parse_nostradamus_response(
+                    resp,
+                    project=item_req['project'],
+                    fm_override=item_req['local_model'] if item_req['run_mode'] == 'local' else None,
+                    as_of_date=as_of_date_item,
+                    freq=payload.get('freq'),
+                )
+
+                if df_new.empty:
+                    st.warning("Could not parse any forecast rows from response.")
+                else:
+                    con = get_connection()
+                    df_new = df_new.copy()
+                    con.register('forecasts_api_df_item', df_new)
+                    con.execute(
+                        """
+                        DELETE FROM forecasts
+                        WHERE project = ?
+                          AND item_id = ?
+                          AND split_part(forecast_method, '@', 1) IN (
+                              SELECT DISTINCT forecast_method FROM forecasts_api_df_item
+                          )
+                        """,
+                        [item_req['project'], item_req['item_id']],
+                    )
+                    con.execute(
+                        "INSERT INTO forecasts (project, forecast_method, item_id, forecast_date, forecast) "
+                        "SELECT project, forecast_method, item_id, forecast_date, forecast FROM forecasts_api_df_item"
+                    )
+                    con.close()
+                    st.success(
+                        f"Saved {len(df_new)} forecast rows (overwrote existing for same method)."
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
 
     # (item-level parameter form lives in the sidebar)
 
@@ -1734,6 +1758,23 @@ def main():
         st.dataframe(pivot.style.format("{:.2f}"))
         with st.expander("Raw metric rows"):
             st.dataframe(metrics_df)
+
+    if st.button(
+        "Recalculate error metrics for selected item/methods",
+        key="recalc_item_metrics_btn",
+        help="Recomputes metrics from sales_history + forecasts for this item and overwrites matching rows in forecast_metrics.",
+    ):
+        from metrics import recompute_item_metrics
+
+        with st.spinner("Recomputing metrics for this item…"):
+            inserted = recompute_item_metrics(
+                project=str(project),
+                item_id=str(item_id),
+                base_methods=list(selected_methods or []),
+            )
+        st.cache_data.clear()
+        st.success(f"Recomputed metrics. Inserted {inserted} rows.")
+        st.rerun()
 
     # Show data
     with st.expander("Show raw data"):
