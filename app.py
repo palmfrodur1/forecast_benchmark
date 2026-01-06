@@ -615,6 +615,17 @@ def _get_lightgpt_settings() -> tuple[str, str]:
     return base_url, api_key
 
 
+def _get_nixtla_api_key() -> str:
+    """Return the Nixtla API key (used by TimeGPT and LightGPT backends).
+
+    Priority:
+    - Streamlit session input
+    - Environment variable NIXTLA_API_KEY
+    """
+
+    return (st.session_state.get('timegpt_api_key') or os.getenv('NIXTLA_API_KEY') or '').strip()
+
+
 def _load_item_features(project: str) -> pd.DataFrame:
     con = get_connection()
     df = con.execute(
@@ -921,10 +932,10 @@ def main():
             help='Used for Nostradamus forecast endpoints and LightGPT; sent as X-API-Key header (leave blank if not required).',
         )
         st.text_input(
-            'TimeGPT API key (optional)',
+            'Nixtla / TimeGPT API key (optional)',
             type='password',
             key='timegpt_api_key',
-            help='Only used when Mode=timegpt; sent in the request payload (this is separate from the Nostradamus/LightGPT key).',
+            help='Used for TimeGPT mode and LightGPT. Sent in the request payload as NIXTLA_API_KEY (separate from the Nostradamus/LightGPT X-API-Key header).',
         )
 
         # LightGPT uses the same Nostradamus base URL + key; feature-flag only.
@@ -1308,6 +1319,19 @@ def main():
                 if not payload.get('sim_input_his'):
                     st.error('Could not build LightGPT payload (no usable histories).')
                 else:
+                    nixtla_key = _get_nixtla_api_key()
+                    if not nixtla_key:
+                        st.error(
+                            'Missing Nixtla API key. LightGPT requires an `api_key` in the request payload; '
+                            'set it in Settings (Nixtla / TimeGPT API key) or via the NIXTLA_API_KEY environment variable.'
+                        )
+                        nixtla_key = ''
+
+                    payload = dict(payload)
+                    if nixtla_key:
+                        # The LightGPT OpenAPI schema uses `api_key`.
+                        payload['api_key'] = nixtla_key
+
                     base_url, key = _get_lightgpt_settings()
                     base_url = _normalize_localhost_url(base_url)
                     if not base_url:
@@ -1327,7 +1351,17 @@ def main():
                                 timeout_s=float(lightgpt_req['timeout_seconds']),
                             )
                         except Exception as e:
-                            st.error(f'LightGPT request failed: {e}')
+                            msg = str(e)
+                            if 'unsupported model' in msg.lower() and 'lightgpt' in msg.lower():
+                                st.error(
+                                    "LightGPT request failed: this Nostradamus API deployment does not support the LightGPT model. "
+                                    "This is typically an account/feature flag or server-version issue (not your API key). "
+                                    "Try a different API base URL (e.g., your own local/server deployment that includes LightGPT) "
+                                    "or contact the API provider to enable LightGPT for your key."
+                                )
+                                st.caption(f"Raw error: {msg}")
+                            else:
+                                st.error(f'LightGPT request failed: {e}')
                             resp = None
 
                         if resp is not None:

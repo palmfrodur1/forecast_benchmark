@@ -48,7 +48,14 @@ def call_lightgpt_batch(
 
     headers = {"Content-Type": "application/json"}
     if api_key:
-        headers["X-API-Key"] = api_key
+      headers["X-API-Key"] = api_key
+
+    # The LightGPT OpenAPI schema uses `api_key` for the Nixtla key.
+    # As a fallback for some deployments, also send it in a dedicated header.
+    # Never log or print the key value.
+    nixtla_key = payload_to_send.get('api_key')
+    if isinstance(nixtla_key, str) and nixtla_key.strip():
+      headers['X-NIXTLA-API-KEY'] = nixtla_key.strip()
 
     resp = requests.post(url, json=payload_to_send, headers=headers, timeout=timeout_s)
     try:
@@ -60,7 +67,11 @@ def call_lightgpt_batch(
       except Exception:
         body = None
       sent_freq = payload_to_send.get('freq')
-      msg = f"LightGPT HTTP {resp.status_code} for {resp.url} (sent freq={sent_freq!r})"
+      has_nixtla = bool(isinstance(payload_to_send.get('api_key'), str) and payload_to_send.get('api_key').strip())
+      msg = (
+        f"LightGPT HTTP {resp.status_code} for {resp.url} "
+        f"(sent freq={sent_freq!r}, sent_has_api_key={has_nixtla})"
+      )
       if body:
         # Avoid exploding logs; keep it reasonably small.
         msg += f"\nResponse body (truncated):\n{body[:4000]}"
