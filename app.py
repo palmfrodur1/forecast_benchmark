@@ -663,6 +663,7 @@ def _build_lightgpt_payload(
     - sim_input_his: list of {item_id, actual_sale, day} at monthly frequency (month-start)
     - item_attributes: list of {item_id, name, item_type, flavour, size}
     - forecast_periods: int
+    - freq: 'M'
     """
 
     if hist_df.empty:
@@ -727,6 +728,9 @@ def _build_lightgpt_payload(
         'item_attributes': item_attributes,
         'forecast_periods': int(forecast_periods),
         'forecast_type': 'batch',
+        # LightGPT API expects monthly as 'M' (not 'MS').
+        # We aggregate to month-start internally, but still request monthly periods.
+        'freq': 'M',
     }
     return payload, as_of_map, id_map
 
@@ -1222,7 +1226,7 @@ def main():
                                 "No Nostradamus API key is set. We'll call LightGPT without X-API-Key. "
                                 "If the hosted API returns an error, the response body will be shown to help diagnose it."
                             )
-                        st.caption('Sending item_features batch to LightGPT (monthly).')
+                        st.caption(f"Sending item_features batch to LightGPT (freq={payload.get('freq')!r}).")
                         try:
                             resp = call_lightgpt_batch(
                                 base_url,
