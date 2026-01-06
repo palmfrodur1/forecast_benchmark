@@ -307,6 +307,22 @@ Target schema/database is MYSQL_DATABASE (default: forecast_benchmark).
             )
         )
 
+        conn.execute(
+            sa.text(
+                """
+                CREATE TABLE IF NOT EXISTS scoreboard_periods (
+                    project              VARCHAR(255) NOT NULL,
+                    period_key           VARCHAR(64)  NOT NULL,
+                    start_date           DATE         NOT NULL,
+                    end_date             DATE         NOT NULL,
+                    abs_actual_threshold DOUBLE       NULL,
+                    last_updated         TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_scoreboard_periods (project, period_key)
+                )
+                """
+            )
+        )
+
 
 # -----------------------------
 # Public API (existing imports)
@@ -368,6 +384,19 @@ def init_db():
             metric_value     DOUBLE,
             n_points         INTEGER,
             last_updated     TIMESTAMP DEFAULT current_timestamp
+        );
+    """
+    )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scoreboard_periods (
+            project              VARCHAR,
+            period_key           VARCHAR,
+            start_date           DATE,
+            end_date             DATE,
+            abs_actual_threshold DOUBLE,
+            last_updated         TIMESTAMP DEFAULT current_timestamp
         );
     """
     )

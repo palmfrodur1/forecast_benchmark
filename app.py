@@ -10,6 +10,7 @@ import requests
 import json
 import os
 import time
+import html
 from urllib.parse import urlparse, urlunparse
 from client_lightgpt import call_lightgpt_batch
 
@@ -409,6 +410,28 @@ def get_forecast_methods(project: str, item_id: str):
     con.close()
     return df["forecast_method"].tolist()
 
+
+@st.cache_data(ttl=60)
+def get_project_forecast_methods(project: str) -> list[str]:
+    """Return all base forecast methods present in forecasts for a project.
+
+    Used to keep series colors stable across different items.
+    """
+    con = get_connection()
+    df = con.execute(
+        """
+        SELECT DISTINCT split_part(forecast_method, '@', 1) AS forecast_method
+        FROM forecasts
+        WHERE project = ?
+        ORDER BY forecast_method
+        """,
+        [project],
+    ).fetchdf()
+    con.close()
+    if df.empty:
+        return []
+    return df["forecast_method"].dropna().astype(str).tolist()
+
 @st.cache_data
 def load_series(project: str, item_id: str, methods: list[str]):
     con = get_connection()
@@ -609,6 +632,44 @@ def _load_item_features(project: str) -> pd.DataFrame:
     if not df.empty and 'item_id' in df.columns:
         df['item_id'] = df['item_id'].astype(str)
     return df
+
+
+@st.cache_data(ttl=60)
+def _get_item_name(project: str, item_id: str) -> str:
+    """Return item_features.name for (project, item_id) or '' if missing."""
+    con = get_connection()
+    try:
+        df = con.execute(
+            """
+            SELECT name
+            FROM item_features
+            WHERE project = ? AND item_id = ?
+            LIMIT 1
+            """,
+            [project, str(item_id)],
+        ).fetchdf()
+    except Exception:
+        return ""
+    finally:
+        con.close()
+
+    if df is None or df.empty:
+        return ""
+    v = df.iloc[0].get('name')
+    if pd.isna(v):
+        return ""
+    return str(v)
+
+
+@st.cache_data(ttl=60)
+def _get_item_features_item_ids(project: str) -> set[str]:
+    try:
+        df = _load_item_features(project)
+    except Exception:
+        return set()
+    if df is None or df.empty or 'item_id' not in df.columns:
+        return set()
+    return set(df['item_id'].dropna().astype(str).tolist())
 
 
 def _load_item_features_all() -> pd.DataFrame:
@@ -847,23 +908,23 @@ def main():
     if 'timegpt_api_key' not in st.session_state:
         st.session_state['timegpt_api_key'] = ''
 
-    with st.sidebar.expander('Settings', expanded=True):
+    with st.sidebar.expander('Settings', expanded=False):
         st.text_input(
             'Nostradamus API base URL',
             key='nostradamus_api_base_url',
             help='Base URL for forecast jobs, e.g. https://api.nostradamus-api.com',
         )
         st.text_input(
-            'Nostradamus API key (optional)',
+            'Nostradamus / LightGPT API key (optional)',
             type='password',
             key='nostradamus_api_key',
-            help='Sent as X-API-Key header to the Nostradamus API (leave blank if not required).',
+            help='Used for Nostradamus forecast endpoints and LightGPT; sent as X-API-Key header (leave blank if not required).',
         )
         st.text_input(
             'TimeGPT API key (optional)',
             type='password',
             key='timegpt_api_key',
-            help='Only used when Mode=timegpt; sent in the request payload.',
+            help='Only used when Mode=timegpt; sent in the request payload (this is separate from the Nostradamus/LightGPT key).',
         )
 
         # LightGPT uses the same Nostradamus base URL + key; feature-flag only.
@@ -885,10 +946,24 @@ def main():
         on_change=_on_app_project_change,
     )
 
+    # Rendered later (below prev/next buttons), but we still need its value
+    # here to filter the item list deterministically.
+    only_item_features = bool(st.session_state.get('main_only_item_features', False))
+
     items = get_items(project)
     if not items:
         st.warning("No items for this project.")
         return
+
+    if only_item_features:
+        allowed = _get_item_features_item_ids(project)
+        if not allowed:
+            st.warning("No rows found in item_features for this project.")
+            return
+        items = [i for i in items if str(i) in allowed]
+        if not items:
+            st.warning("No items left after filtering to item_features.")
+            return
 
     _ensure_single_choice_state('main_item_id', items)
 
@@ -910,6 +985,16 @@ def main():
 
     item_id = st.sidebar.selectbox("Item", items, key='main_item_id')
 
+    item_name = _get_item_name(project, item_id)
+    name_suffix = f" - {item_name}" if item_name else ""
+    header_line = f"Project: {project} - Item: {item_id}{name_suffix}"
+    st.markdown(
+        f"<div style='font-size: 1.3rem; line-height: 1.6; margin-top: -0.25rem;'>"
+        f"{html.escape(header_line)}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
     try:
         _cur_idx = items.index(st.session_state.get('main_item_id'))
     except Exception:
@@ -922,6 +1007,13 @@ def main():
         on_click=_select_next_item,
         disabled=_cur_idx >= (len(items) - 1),
         use_container_width=True,
+    )
+
+    st.sidebar.checkbox(
+        "Only selected items",
+        value=only_item_features,
+        key='main_only_item_features',
+        help="When enabled, only show items that exist in the item_features table for this project.",
     )
 
     # Viewing: always show all methods; legend click toggles visibility.
@@ -1451,7 +1543,7 @@ def main():
     history, forecasts, combined = load_series(project, item_id, selected_methods)
     metrics_df = load_metrics(project, item_id, selected_methods)
 
-    st.subheader(f"Item: {item_id} — Project: {project}")
+    # (Header caption shown at top of page.)
 
     item_req = st.session_state.pop('_item_forecast_request', None)
     if item_req:
@@ -1623,7 +1715,7 @@ def main():
     # Date range controls (by month) - placed near chart
     st.markdown("---")
     
-    col1, col2, col3 = st.columns([0.08, 0.76, 0.16])
+    col1, col2, col3 = st.columns([0.16, 0.68, 0.16])
     
     with col1:
         months_back = st.number_input(
@@ -1713,16 +1805,54 @@ def main():
     )
     
     # Main chart
-    # Legend click toggles each series on/off, while keeping all legend entries.
-    series_domain = sorted([s for s in combined_filtered['series'].dropna().unique().tolist()])
+    # Pinned colors + legend toggling for History, History (Monthly), and methods.
+    # History is always first in the legend.
+    method_domain = get_project_forecast_methods(project)
+
+    # Tableau20 palette (20 colors) for stable method mapping.
+    tableau20 = [
+        "#4E79A7",
+        "#F28E2B",
+        "#E15759",
+        "#76B7B2",
+        "#59A14F",
+        "#EDC948",
+        "#B07AA1",
+        "#FF9DA7",
+        "#9C755F",
+        "#BAB0AC",
+        "#A0CBE8",
+        "#FFBE7D",
+        "#FF9D9A",
+        "#9CDED6",
+        "#8CD17D",
+        "#F1CE63",
+        "#D4A6C8",
+        "#FABFD2",
+        "#D7B5A6",
+        "#D3D3D3",
+    ]
+
+    method_colors = [tableau20[i % len(tableau20)] for i in range(len(method_domain))]
+    method_color_map = dict(zip(method_domain, method_colors))
+
+    present = set(combined_filtered['series'].dropna().astype(str).unique().tolist())
+    include_monthly = bool(show_monthly_history) and ("History (Monthly)" in present)
+
+    # Legend ordering: History, then History (Monthly) if enabled, then methods.
+    present_methods = [m for m in method_domain if m in present]
+    present_method_colors = [method_color_map[m] for m in present_methods]
+
+    series_domain = ["History"] + (["History (Monthly)"] if include_monthly else []) + present_methods
+    series_range = ["blue"] + (["lightblue"] if include_monthly else []) + present_method_colors
+
+    legend_domain = [s for s in series_domain if s in present]
+
     series_sel = alt.selection_point(
         fields=["series"],
         bind="legend",
-        # Click toggles membership (no need for shift-click). Using string for compatibility.
         toggle="true",
-        # Start with everything visible. Clicking a legend item toggles it off/on.
-        value=[{"series": s} for s in series_domain],
-        # If everything is toggled off, show nothing (but legend remains).
+        value=[{"series": s} for s in legend_domain],
         empty="none",
     )
 
@@ -1733,7 +1863,10 @@ def main():
         .encode(
             x=alt.X("date:T"),
             y=alt.Y("value:Q"),
-            color=alt.Color("series:N", scale=alt.Scale(domain=series_domain)),
+            color=alt.Color(
+                "series:N",
+                scale=alt.Scale(domain=series_domain, range=series_range),
+            ),
             tooltip=["series", "date", "value"],
         )
         .properties(height=400)

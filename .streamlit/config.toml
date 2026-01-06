@@ -1,2 +1,11 @@
 [client]
 showSidebarNavigation = false
+
+[theme]
+# M7-inspired palette (teal + charcoal) with a dark base.
+base = "dark"
+primaryColor = "#008CA8"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#151A23"
+textColor = "#F3F6FA"
+font = "sans serif"

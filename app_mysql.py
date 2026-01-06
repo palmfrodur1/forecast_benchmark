@@ -8,6 +8,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 import sqlalchemy as sa
+import html
 
 from db import get_mysql_engine, init_mysql_db
 from nav import render_sidebar_nav
@@ -34,6 +35,58 @@ def _read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
     eng = _engine()
     with eng.connect() as conn:
         return pd.read_sql(sa.text(sql), conn, params=params or {})
+
+
+@st.cache_data(ttl=60)
+def get_project_forecast_methods(project: str) -> list[str]:
+    df = _read_df(
+        """
+        SELECT DISTINCT SUBSTRING_INDEX(forecast_method, '@', 1) AS forecast_method
+        FROM forecasts
+        WHERE project = :project
+        ORDER BY forecast_method
+        """,
+        {"project": project},
+    )
+    if df is None or df.empty:
+        return []
+    return df["forecast_method"].dropna().astype(str).tolist()
+
+
+@st.cache_data(ttl=60)
+def _get_item_features_item_ids(project: str) -> set[str]:
+    try:
+        df = _read_df(
+            "SELECT item_id FROM item_features WHERE project = :project",
+            {"project": project},
+        )
+    except Exception:
+        return set()
+    if df is None or df.empty or 'item_id' not in df.columns:
+        return set()
+    return set(df['item_id'].dropna().astype(str).tolist())
+
+
+@st.cache_data(ttl=60)
+def _get_item_name(project: str, item_id: str) -> str:
+    try:
+        df = _read_df(
+            """
+            SELECT name
+            FROM item_features
+            WHERE project = :project AND item_id = :item_id
+            LIMIT 1
+            """,
+            {"project": project, "item_id": str(item_id)},
+        )
+    except Exception:
+        return ""
+    if df is None or df.empty:
+        return ""
+    v = df.iloc[0].get('name')
+    if pd.isna(v):
+        return ""
+    return str(v)
 
 
 def _in_params(name: str, values: list[str]) -> tuple[str, dict]:
@@ -237,12 +290,39 @@ def main() -> None:
 
     project = st.sidebar.selectbox("Project", projects, key="mysql_project")
 
+    only_item_features = st.sidebar.checkbox(
+        "Only items in item_features",
+        value=False,
+        key='mysql_only_item_features',
+        help="When enabled, only show items that exist in the item_features table for this project.",
+    )
+
     items = get_items(project)
     if not items:
         st.warning("No items for this project.")
         return
 
+    if only_item_features:
+        allowed = _get_item_features_item_ids(project)
+        if not allowed:
+            st.warning("No rows found in item_features for this project.")
+            return
+        items = [i for i in items if str(i) in allowed]
+        if not items:
+            st.warning("No items left after filtering to item_features.")
+            return
+
     item_id = st.sidebar.selectbox("Item", items, key="mysql_item")
+
+    item_name = _get_item_name(project, item_id)
+    name_suffix = f" - {item_name}" if item_name else ""
+    header_line = f"Project: {project} - Item: {item_id}{name_suffix}"
+    st.markdown(
+        f"<div style='font-size: 1.3rem; line-height: 1.6; margin-top: -0.25rem;'>"
+        f"{html.escape(header_line)}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     methods = get_forecast_methods(project, item_id)
     selected_methods = methods  # show all by default
@@ -250,11 +330,11 @@ def main() -> None:
     history, forecasts, combined = load_series(project, item_id, selected_methods)
     metrics_df = load_metrics(project, item_id, selected_methods)
 
-    st.subheader(f"Item: {item_id} — Project: {project}")
+    # (Header caption shown at top of page.)
 
     st.markdown("---")
 
-    col1, col2, col3 = st.columns([0.08, 0.76, 0.16])
+    col1, col2, col3 = st.columns([0.16, 0.68, 0.16])
     with col1:
         months_back = st.number_input("Months back", min_value=0, max_value=120, value=24, step=1, key="months_back")
     with col3:
@@ -311,12 +391,51 @@ def main() -> None:
         opacity=0.08, color="orange"
     ).encode(x="start:T", x2="end:T")
 
-    series_domain = sorted([s for s in combined_filtered["series"].dropna().unique().tolist()])
+    # Pinned colors + legend toggling for History, History (Monthly), and methods.
+    method_domain = get_project_forecast_methods(project)
+
+    tableau20 = [
+        "#4E79A7",
+        "#F28E2B",
+        "#E15759",
+        "#76B7B2",
+        "#59A14F",
+        "#EDC948",
+        "#B07AA1",
+        "#FF9DA7",
+        "#9C755F",
+        "#BAB0AC",
+        "#A0CBE8",
+        "#FFBE7D",
+        "#FF9D9A",
+        "#9CDED6",
+        "#8CD17D",
+        "#F1CE63",
+        "#D4A6C8",
+        "#FABFD2",
+        "#D7B5A6",
+        "#D3D3D3",
+    ]
+
+    method_colors = [tableau20[i % len(tableau20)] for i in range(len(method_domain))]
+    method_color_map = dict(zip(method_domain, method_colors))
+
+    present = set(combined_filtered["series"].dropna().astype(str).unique().tolist())
+    include_monthly = bool(show_monthly_history) and ("History (Monthly)" in present)
+
+    present_methods = [m for m in method_domain if m in present]
+    present_method_colors = [method_color_map[m] for m in present_methods]
+
+    series_domain = ["History"] + (["History (Monthly)"] if include_monthly else []) + present_methods
+    series_range = ["blue"] + (["lightblue"] if include_monthly else []) + present_method_colors
+
+    legend_domain = [s for s in series_domain if s in present]
+
     series_sel = alt.selection_point(
         fields=["series"],
         bind="legend",
         toggle="true",
-        value=[{"series": s} for s in series_domain],
+        value=[{"series": s} for s in legend_domain],
         empty="none",
     )
 
@@ -327,7 +446,10 @@ def main() -> None:
         .encode(
             x=alt.X("date:T"),
             y=alt.Y("value:Q"),
-            color=alt.Color("series:N", scale=alt.Scale(domain=series_domain)),
+            color=alt.Color(
+                "series:N",
+                scale=alt.Scale(domain=series_domain, range=series_range),
+            ),
             tooltip=["series", "date", "value"],
         )
         .properties(height=400)
