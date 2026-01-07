@@ -735,7 +735,7 @@ def _build_lightgpt_payload(
     - sim_input_his: list of {item_id, actual_sale, day} at monthly frequency (month-start)
     - item_attributes: list of {item_id, name, item_type, flavour, size}
     - forecast_periods: int
-    - freq: 'M'
+    - freq: 'MS'
     """
 
     if hist_df.empty:
@@ -756,10 +756,39 @@ def _build_lightgpt_payload(
         .sum()
         .sort_values(['project', 'item_id', 'sale_date'])
     )
+    # LightGPT / Nixtla expects regular series (no missing months) for each item.
+    # Fill missing months within each item from first->last with 0.0 sales.
+    def _fill_missing_months(g: pd.DataFrame) -> pd.DataFrame:
+        if g is None or g.empty:
+            return g
+        g = g.sort_values('sale_date').copy()
+        start = g['sale_date'].min()
+        end = g['sale_date'].max()
+        if pd.isna(start) or pd.isna(end):
+            return g
+        full_idx = pd.date_range(start=start, end=end, freq='MS')
+        base = {
+            'project': str(g['project'].iloc[0]),
+            'item_id': str(g['item_id'].iloc[0]),
+        }
+        g2 = g.set_index('sale_date').reindex(full_idx)
+        g2.index.name = 'sale_date'
+        # Fill identifiers for the newly created rows.
+        g2['project'] = base['project']
+        g2['item_id'] = base['item_id']
+        g2['sales'] = pd.to_numeric(g2['sales'], errors='coerce').fillna(0.0)
+        return g2.reset_index()
+
+    df_hist = (
+        df_hist.groupby(['project', 'item_id'], group_keys=False)
+        .apply(_fill_missing_months)
+        .reset_index(drop=True)
+    )
+
     # LightGPT tends to expect non-negative demand signals; also avoid NaNs.
     df_hist['sales'] = pd.to_numeric(df_hist['sales'], errors='coerce').fillna(0.0)
     df_hist.loc[df_hist['sales'] < 0, 'sales'] = 0.0
-    df_hist['sale_date'] = df_hist['sale_date'].dt.date
+    df_hist['sale_date'] = pd.to_datetime(df_hist['sale_date'], errors='coerce').dt.date
 
     # Disambiguate across projects
     df_hist['ext_item_id'] = df_hist.apply(
@@ -800,9 +829,8 @@ def _build_lightgpt_payload(
         'item_attributes': item_attributes,
         'forecast_periods': int(forecast_periods),
         'forecast_type': 'batch',
-        # LightGPT API expects monthly as 'M' (not 'MS').
-        # We aggregate to month-start internally, but still request monthly periods.
-        'freq': 'M',
+        # We aggregate to month-start internally, so request month-start frequency.
+        'freq': 'MS',
     }
     return payload, as_of_map, id_map
 

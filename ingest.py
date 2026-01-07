@@ -203,6 +203,134 @@ def import_sales_history_horizontal_months(
         "max_date": str(out_df["sale_date"].max()),
     }
 
+
+def import_forecasts_horizontal_months(
+    csv_bytes: bytes,
+    *,
+    project: str,
+    forecast_method: str,
+    overwrite_project_date_range: bool = True,
+) -> dict:
+    """Import wide monthly forecast CSV into forecasts.
+
+    Expected shape: one row per item/year with the last 12 fields as month values.
+    Each month value is imported on the first of that month.
+
+    Rules:
+    - `project` and `forecast_method` are provided by the user (not from file).
+    - Skip blanks.
+    - Import 0 as 0.
+    """
+
+    if not project or not project.strip():
+        raise ValueError("project is required")
+    if not forecast_method or not forecast_method.strip():
+        raise ValueError("forecast_method is required")
+
+    project = project.strip()
+    forecast_method = forecast_method.strip()
+
+    df = _try_read_csv_bytes(csv_bytes, sep=";")
+    if df.empty:
+        return {"rows_inserted": 0, "items": 0, "years": 0}
+
+    rows_out: list[dict] = []
+    item_ids: set[str] = set()
+    years: set[int] = set()
+
+    for _, row in df.iterrows():
+        values = ["" if pd.isna(v) else str(v) for v in row.tolist()]
+
+        # Skip header-ish row(s)
+        if values and str(values[0]).strip().upper().startswith("HORIZONTAL"):
+            continue
+
+        if len(values) < 13:
+            continue
+
+        month_cells = values[-12:]
+        meta = values[:-12]
+
+        year: int | None = None
+        for cell in meta:
+            m = _YEAR_RE.match(str(cell))
+            if m:
+                year = int(m.group(1))
+                break
+        if year is None:
+            continue
+
+        item_id: str | None = None
+        for cell in meta:
+            s = str(cell).strip()
+            if not s:
+                continue
+            if _YEAR_RE.match(s):
+                continue
+            item_id = s
+            break
+        if item_id is None:
+            continue
+
+        item_ids.add(item_id)
+        years.add(year)
+
+        for month_index, cell in enumerate(month_cells, start=1):
+            s = str(cell).strip()
+            if not s:
+                continue
+            forecast = _parse_decimal_comma(s)
+            rows_out.append(
+                {
+                    "project": project,
+                    "forecast_method": forecast_method,
+                    "item_id": item_id,
+                    "forecast_date": date(year, month_index, 1),
+                    "forecast": forecast,
+                }
+            )
+
+    if not rows_out:
+        return {"rows_inserted": 0, "items": 0, "years": 0}
+
+    out_df = pd.DataFrame(rows_out)
+
+    con = get_connection()
+    try:
+        if overwrite_project_date_range:
+            min_date = out_df["forecast_date"].min()
+            max_date = out_df["forecast_date"].max()
+            con.execute(
+                """
+                DELETE FROM forecasts
+                WHERE project = ?
+                  AND forecast_method = ?
+                  AND forecast_date BETWEEN ? AND ?
+                """,
+                [project, forecast_method, min_date, max_date],
+            )
+
+        con.register("forecasts_df", out_df)
+        con.execute(
+            """
+            INSERT INTO forecasts
+            SELECT project, forecast_method, item_id, forecast_date, forecast
+            FROM forecasts_df
+            """
+        )
+    finally:
+        con.close()
+
+    return {
+        "rows_inserted": int(len(out_df)),
+        "items": int(len(item_ids)),
+        "years": int(len(years)),
+        "min_date": str(out_df["forecast_date"].min()),
+        "max_date": str(out_df["forecast_date"].max()),
+        "forecast_method": forecast_method,
+        "project": project,
+    }
+
 if __name__ == "__main__":
     sales_csv = DATA_DIR / "sales_history.csv"
     forecasts_csv = DATA_DIR / "forecasts.csv"

@@ -9,17 +9,17 @@ from requests import HTTPError
 def _normalize_lightgpt_freq(freq: Optional[str]) -> str:
   """Normalize frequency values for LightGPT.
 
-  The LightGPT API expects monthly as 'M' (and may reject 'MS').
-  We treat missing/unknown monthly-ish values as 'M' by default.
+  Nixtla validates that timestamps match the provided frequency.
+  In this client, our monthly timestamps are month-start, so we default to 'MS'.
   """
 
   if freq is None:
-    return 'M'
+    return 'MS'
   f = str(freq).strip().lower()
   if f in {'', 'none'}:
-    return 'M'
+    return 'MS'
   if f in {'month', 'monthly', 'm', 'ms'}:
-    return 'M'
+    return 'MS'
   if f in {'d', 'day', 'daily'}:
     return 'D'
   return str(freq)
@@ -42,6 +42,19 @@ def call_lightgpt_batch(
 
     # Default LightGPT to monthly frequency unless explicitly overridden.
     payload_to_send = dict(payload or {})
+
+    # Accept common aliases used by other callers.
+    # Canonicalize to the OpenAPI field names expected by the LightGPT API.
+    if 'api_key' not in payload_to_send or payload_to_send.get('api_key') in (None, ''):
+      for k in ('apiKey', 'nixtla_api_key', 'nixtlaApiKey', 'NIXTLA_API_KEY'):
+        v = payload_to_send.get(k)
+        if isinstance(v, str) and v.strip():
+          payload_to_send['api_key'] = v.strip()
+          break
+
+    if 'exogenous_columns' not in payload_to_send and 'exogenousColumns' in payload_to_send:
+      payload_to_send['exogenous_columns'] = payload_to_send.get('exogenousColumns')
+
     payload_to_send['freq'] = _normalize_lightgpt_freq(payload_to_send.get('freq'))
 
     url = base_url.rstrip('/') + '/api/v1/lightgpt/batch'
@@ -55,6 +68,9 @@ def call_lightgpt_batch(
     # Never log or print the key value.
     nixtla_key = payload_to_send.get('api_key')
     if isinstance(nixtla_key, str) and nixtla_key.strip():
+      # Preferred canonical header name (HTTP headers are case-insensitive).
+      headers['X-Nixtla-Api-Key'] = nixtla_key.strip()
+      # Backwards-compatible legacy header name.
       headers['X-NIXTLA-API-KEY'] = nixtla_key.strip()
 
     resp = requests.post(url, json=payload_to_send, headers=headers, timeout=timeout_s)
