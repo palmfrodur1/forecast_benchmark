@@ -245,6 +245,7 @@ def _parse_nostradamus_response(
     resp: dict,
     project: str,
     fm_override: str | None = None,
+    requested_model: str | None = None,
     *,
     as_of_date: date | None = None,
     freq: str | None = None,
@@ -275,7 +276,7 @@ def _parse_nostradamus_response(
         # Special case: if the user requested AutoModel, keep that provenance
         # visible but record the actual model returned by Nostradamus.
         # Example: user selects auto_model, API returns model_used=auto_arima -> AM:auto_arima
-        if str(fm_override or '').strip().lower() == 'auto_model':
+        if str(requested_model or '').strip().lower() == 'auto_model':
             resolved = model_used or top_model or 'unknown'
             fm = f"AM:{resolved}"
         else:
@@ -1561,6 +1562,7 @@ def main():
                             job.get('result'),
                             project=project_req['project'],
                             fm_override=project_req['local_model'] if project_req['run_mode'] == 'local' else None,
+                            requested_model=project_req.get('local_model'),
                             as_of_date=as_of_date,
                             freq=payload.get('freq'),
                         )
@@ -1740,6 +1742,7 @@ def main():
                     resp,
                     project=item_req['project'],
                     fm_override=item_req['local_model'] if item_req['run_mode'] == 'local' else None,
+                    requested_model=item_req.get('local_model'),
                     as_of_date=as_of_date_item,
                     freq=payload.get('freq'),
                 )
